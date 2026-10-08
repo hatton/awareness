@@ -240,7 +240,7 @@ export const register: Register = on => {
     const card = git === null ? undefined : /^BL-\d+/i.exec(git.branch)?.[0].toUpperCase()
 
     return (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={1} paddingLeft={2}>
         <Text bold dimColor>
           Awareness Mod
         </Text>
