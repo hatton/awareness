@@ -296,3 +296,35 @@ test('takes the skill from a typed slash command, but not a built-in one', async
   expect((await ui.findAll({ type: 'Text' })).find(t => t.text.startsWith('Working on'))?.text).toBe('Working on: Preflight')
   await ui.unmount()
 })
+
+test('ignores an update for a task it never saw that names nothing', () => {
+  const tasks = { '1': { doing: 'Fixing Devin bugs', status: 'in_progress' as const } }
+  expect(updatedTasks(tasks, { taskId: '9', status: 'in_progress' })).toEqual(tasks)
+  expect(updatedTasks({}, { taskId: '9', status: 'in_progress', activeForm: 'Merging in master' })).toEqual({
+    '9': { doing: 'Merging in master', status: 'in_progress' },
+  })
+})
+
+test('clears the Working on line when the main conversation goes idle, not when a subagent does', async ($, on) => {
+  answerBottoms(on)
+  on('tool.call', () => ({ result: { success: true, commandName: 'preflight' } }) as never)
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('session.cwd', () => ({ value: 'D:/w' }) as never)
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '' } }) as never)
+  on('agent.list', () => ({ value: [] }) as never)
+  const workingLine = async () => {
+    const ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
+    const line = (await ui.findAll({ type: 'Text' })).find(t => t.text.startsWith('Working on'))?.text
+    await ui.unmount()
+    return line
+  }
+
+  await $.tool.call({ tool: 'Skill', skill: 'preflight' } as never)
+  expect(await workingLine()).toBe('Working on: Preflight')
+
+  await $.turn.complete({ turnId: 't1', reason: 'completed', answer: '', agentId: 'sub-1' } as never)
+  expect(await workingLine()).toBe('Working on: Preflight')
+
+  await $.turn.complete({ turnId: 't2', reason: 'completed', answer: '' } as never)
+  expect(await workingLine()).toBeUndefined()
+})

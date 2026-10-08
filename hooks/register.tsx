@@ -218,7 +218,9 @@ const refreshAgents = async ($: EngineInterface) => {
 
 /**
  * Applies a `TaskUpdate` to the tracked task list: a new status or phrase, or
- * the task's removal when it is deleted. An id the list never saw is added.
+ * the task's removal when it is deleted. An id the list never saw (one
+ * created before the list was last cleared) is added only when the update
+ * names what it does; otherwise the list is left as it was.
  */
 export const updatedTasks = (
   tasks: WorkingOn['tasks'],
@@ -228,7 +230,12 @@ export const updatedTasks = (
     const { [change.taskId]: _removed, ...rest } = tasks
     return rest
   }
-  const before = tasks[change.taskId] ?? { doing: change.subject ?? '', status: 'pending' }
+  const known = tasks[change.taskId]
+  const named = change.activeForm ?? change.subject
+  if (known === undefined && named === undefined) {
+    return tasks
+  }
+  const before = known ?? { doing: named ?? '', status: 'pending' as const }
   const status =
     change.status === 'in_progress' || change.status === 'completed' || change.status === 'pending'
       ? change.status
@@ -369,8 +376,12 @@ export const register: Register = on => {
     return result
   })
 
+  // The main conversation's turn ending leaves Claude idle, so nothing is being worked on.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    if (e.agentId === undefined) {
+      await update($, workingOn, () => NOTHING_YET).catch(() => undefined)
+    }
     void refreshAll($)
     void refreshPullRequest($).catch(() => undefined)
     return result
