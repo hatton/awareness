@@ -1,0 +1,6 @@
+{
+  "name": "awareness",
+  "description": "The Awareness mod for Claude Code: a pane with model, context, usage, git state, PR, agents and recent prompts.",
+  "owner": { "name": "John Hatton" },
+  "plugins": [{ "name": "awareness", "source": "./" }]
+}
