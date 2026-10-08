@@ -1,7 +1,7 @@
 import type { On, RenderElement, SiteScroll } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
-import { folderUrl, friendlyModelName, parseGitStatus, parsePullRequest, reviewableUrl } from '../hooks/register'
+import { folderUrl, friendlyModelName, parseGitStatus, parsePullRequest, reviewableUrl, skillTitle, typedSkillName, updatedTasks, workingOnText } from '../hooks/register'
 
 /** Stands in for the engine beneath the plugin: prompts pass, the pane body is empty. */
 const answerBottoms = (on: On) => {
@@ -218,4 +218,81 @@ test('turns a Windows folder into a file URL', () => {
 
 test('turns a pull request URL into its Reviewable page', () => {
   expect(reviewableUrl('https://github.com/BloomBooks/BloomDesktop/pull/8315')).toBe('https://reviewable.io/reviews/BloomBooks/BloomDesktop/8315')
+})
+
+test('builds the Working on line from the skill and the step', () => {
+  const tasks = { '1': { doing: 'Fixing Devin bugs', status: 'in_progress' as const } }
+  expect(workingOnText({ skill: 'Preflight', tasks, todo: null })).toBe('Working on: Preflight, fixing Devin bugs')
+  expect(workingOnText({ skill: 'Preflight', tasks: {}, todo: null })).toBe('Working on: Preflight')
+  expect(workingOnText({ skill: null, tasks, todo: null })).toBe('Working on: Fixing Devin bugs')
+  expect(workingOnText({ skill: 'Preflight', tasks: {}, todo: 'Merging in master' })).toBe('Working on: Preflight, merging in master')
+  expect(workingOnText({ skill: 'Preflight', tasks: {}, todo: 'CI is running' })).toBe('Working on: Preflight, CI is running')
+  expect(workingOnText({ skill: null, tasks: {}, todo: null })).toBeNull()
+  // A finished task is no longer the step.
+  expect(workingOnText({ skill: 'Preflight', tasks: { '1': { doing: 'Fixing Devin bugs', status: 'completed' } }, todo: null })).toBe('Working on: Preflight')
+})
+
+test('names skills and reads them from typed slash commands', () => {
+  expect(skillTitle('preflight')).toBe('Preflight')
+  expect(skillTitle('youtrack-fix')).toBe('Youtrack fix')
+  expect(skillTitle('vercel:deploy')).toBe('Deploy')
+  expect(typedSkillName('/preflight thorough review')).toBe('preflight')
+  expect(typedSkillName('<command-name>/preflight</command-name>\n<command-args></command-args>')).toBe('preflight')
+  expect(typedSkillName('please run preflight')).toBeUndefined()
+})
+
+test('follows a task through the task list', () => {
+  let tasks = updatedTasks({}, { taskId: '7', subject: 'Fix Devin bugs' })
+  expect(tasks).toEqual({ '7': { doing: 'Fix Devin bugs', status: 'pending' } })
+  tasks = updatedTasks(tasks, { taskId: '7', status: 'in_progress', activeForm: 'Fixing Devin bugs' })
+  expect(tasks).toEqual({ '7': { doing: 'Fixing Devin bugs', status: 'in_progress' } })
+  tasks = updatedTasks(tasks, { taskId: '7', status: 'deleted' })
+  expect(tasks).toEqual({})
+})
+
+test('shows the skill the model starts and the task it is on', async ($, on) => {
+  answerBottoms(on)
+  on('tool.call', ($, e) => {
+    if (e.tool === 'Skill') {
+      return { result: { success: true, commandName: 'preflight' } } as never
+    }
+    if (e.tool === 'TaskCreate') {
+      return { result: { task: { id: '1', subject: 'Fix Devin bugs' } } } as never
+    }
+    return { result: {} } as never
+  })
+  on('session.cwd', () => ({ value: 'D:/w' }) as never)
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '' } }) as never)
+  on('agent.list', () => ({ value: [] }) as never)
+
+  await $.tool.call({ tool: 'Skill', skill: 'preflight' } as never)
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Fix Devin bugs', description: 'd', activeForm: 'Fixing Devin bugs' } as never)
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'in_progress' } as never)
+
+  const ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
+  const texts = await ui.findAll({ type: 'Text' })
+  const line = texts.findIndex(t => t.text.startsWith('Working on'))
+  expect(texts[line]?.text).toBe('Working on: Preflight, fixing Devin bugs')
+  // It sits just above the "Recent Prompts" heading, in the newest prompt's colour.
+  expect(texts[line + 1]?.text).toBe('Recent Prompts')
+  expect(texts[line]?.props.color).toBe('suggestion')
+  await ui.unmount()
+})
+
+test('takes the skill from a typed slash command, but not a built-in one', async ($, on) => {
+  answerBottoms(on)
+  on('command.list', () => ({ value: [
+    { name: 'preflight', description: '', source: 'user' },
+    { name: 'clear', description: '', source: 'builtin' },
+  ] }) as never)
+
+  await $.prompt.submit({ text: '/clear', origin: { kind: 'composer' }, wait: true })
+  let ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
+  expect((await ui.findAll({ type: 'Text' })).some(t => t.text.startsWith('Working on'))).toBe(false)
+  await ui.unmount()
+
+  await $.prompt.submit({ text: '/preflight', origin: { kind: 'composer' }, wait: true })
+  ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
+  expect((await ui.findAll({ type: 'Text' })).find(t => t.text.startsWith('Working on'))?.text).toBe('Working on: Preflight')
+  await ui.unmount()
 })

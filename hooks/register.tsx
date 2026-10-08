@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Header, PullRequest, Recent, Repo, RunningAgent } from '../types'
+import type { Header, PullRequest, Recent, Repo, RunningAgent, WorkingOn } from '../types'
 
 const SHOWN = 3
 const PANE = 'awareness'
@@ -27,9 +27,56 @@ const header = atom({ plugin: 'awareness', key: 'header' } as const, {
 const repo = atom({ plugin: 'awareness', key: 'repo' } as const, null as Repo)
 const pullRequest = atom({ plugin: 'awareness', key: 'pullRequest' } as const, null as PullRequest)
 const agents = atom({ plugin: 'awareness', key: 'agents' } as const, [] as readonly RunningAgent[])
+const NOTHING_YET: WorkingOn = { skill: null, tasks: {}, todo: null }
+const workingOn = atom({ plugin: 'awareness', key: 'workingOn' } as const, NOTHING_YET)
 
 /** Collapses a prompt's whitespace so blank lines in it don't stretch the pane. */
 const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim()
+
+/**
+ * Turns a skill's name into a title: `preflight` reads `Preflight`,
+ * `youtrack-fix` `Youtrack fix`, and a plugin's `vercel:deploy` `Deploy`.
+ */
+export const skillTitle = (name: string) => {
+  const words = (name.split(':').pop() ?? name).replace(/[-_]+/g, ' ').trim()
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
+
+/**
+ * Lowers the first letter of a step phrase so it reads after a comma
+ * (`Fixing Devin bugs` reads `fixing Devin bugs`), but leaves a word in
+ * capitals alone (`CI`, `PR`).
+ */
+const lowerFirst = (phrase: string) =>
+  /^[A-Z][a-z]/.test(phrase) ? phrase.charAt(0).toLowerCase() + phrase.slice(1) : phrase
+
+/**
+ * Builds the "Working on:" line: the skill, then the step in progress; null
+ * when neither is known. The step is the in-progress task's phrase, else the
+ * in-progress item of the last `TodoWrite` list.
+ */
+export const workingOnText = (state: WorkingOn) => {
+  const task = Object.values(state.tasks).find(t => t.status === 'in_progress')
+  const step = task?.doing ?? state.todo
+  if (state.skill !== null && step !== null) {
+    return `Working on: ${state.skill}, ${lowerFirst(step)}`
+  }
+  if (state.skill !== null) {
+    return `Working on: ${state.skill}`
+  }
+  if (step !== null) {
+    return `Working on: ${step}`
+  }
+  return null
+}
+
+/**
+ * The skill a prompt starts, when it is a slash command: `/preflight thorough`
+ * names `preflight`, as does the `<command-name>/preflight</command-name>`
+ * form the prompt takes once Claude Code expands it.
+ */
+export const typedSkillName = (text: string) =>
+  /<command-name>\/?([\w:.-]+)<\/command-name>/.exec(text)?.[1] ?? /^\/([\w:.-]+)/.exec(text.trim())?.[1]
 
 /**
  * Turns a model id such as `claude-opus-5-5[1m]` into `Opus 5.5 (1M context)`.
@@ -169,6 +216,43 @@ const refreshAgents = async ($: EngineInterface) => {
   await update($, agents, () => running)
 }
 
+/**
+ * Applies a `TaskUpdate` to the tracked task list: a new status or phrase, or
+ * the task's removal when it is deleted. An id the list never saw is added.
+ */
+export const updatedTasks = (
+  tasks: WorkingOn['tasks'],
+  change: { taskId: string; status?: string; activeForm?: string; subject?: string },
+): WorkingOn['tasks'] => {
+  if (change.status === 'deleted') {
+    const { [change.taskId]: _removed, ...rest } = tasks
+    return rest
+  }
+  const before = tasks[change.taskId] ?? { doing: change.subject ?? '', status: 'pending' }
+  const status =
+    change.status === 'in_progress' || change.status === 'completed' || change.status === 'pending'
+      ? change.status
+      : before.status
+  return {
+    ...tasks,
+    [change.taskId]: { doing: change.activeForm ?? change.subject ?? before.doing, status },
+  }
+}
+
+/** Takes the activity from a prompt that runs a skill as a slash command. */
+const noteTypedSkill = async ($: EngineInterface, text: string) => {
+  const name = typedSkillName(text)
+  if (name === undefined) {
+    return
+  }
+  const command = (await $.command.list()).find(c => c.name === name)
+  // Built-in commands (/clear, /model) and this mod's own name no activity.
+  if (command === undefined || command.source === 'builtin' || command.plugin === 'awareness') {
+    return
+  }
+  await update($, workingOn, w => ({ ...w, skill: skillTitle(name) }))
+}
+
 /** Reads everything the pane shows that can change outside a turn. */
 const refreshAll = async ($: EngineInterface) => {
   await Promise.allSettled([refreshHeader($), refreshRepo($), refreshAgents($)])
@@ -191,6 +275,22 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // /clear starts the conversation over, so the activity starts over too.
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source === 'clear') {
+      await update($, workingOn, () => NOTHING_YET).catch(() => undefined)
+    }
+    return next(e)
+  })
+
+  // A slash command typed at the prompt; noteTypedSkill skips built-ins.
+  on('command.run', async ($, e, next) => {
+    if (e.command !== 'awareness') {
+      await noteTypedSkill($, `/${e.command}`).catch(() => undefined)
+    }
+    return next(e)
+  })
+
   on('command.run', { command: 'awareness' }, async $ => {
     await $.ui.open({ id: PANE, title: TITLE })
 
@@ -204,8 +304,48 @@ export const register: Register = on => {
     if ((e.origin.kind === 'composer' || e.origin.kind === 'bridge') && text) {
       // A failed write must not hold up the prompt.
       await update($, recent, list => [...list, text].slice(-SHOWN)).catch(() => undefined)
+      await noteTypedSkill($, e.text).catch(() => undefined)
     }
     return next(e)
+  })
+
+  // The model starting a skill names the activity.
+  on('tool.call', { tool: 'Skill' }, async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && result.deny === undefined && result.isError !== true) {
+      await update($, workingOn, w => ({ ...w, skill: skillTitle(e.skill) })).catch(() => undefined)
+    }
+    return result
+  })
+
+  // The main conversation's task list names the step in progress.
+  on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && result.deny === undefined && result.isError !== true) {
+      const doing = e.activeForm ?? e.subject
+      await update($, workingOn, w => ({
+        ...w,
+        tasks: { ...w.tasks, [result.result.task.id]: { doing, status: 'pending' as const } },
+      })).catch(() => undefined)
+    }
+    return result
+  })
+
+  on('tool.call', { tool: 'TaskUpdate' }, async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && result.deny === undefined && result.isError !== true) {
+      await update($, workingOn, w => ({ ...w, tasks: updatedTasks(w.tasks, e) })).catch(() => undefined)
+    }
+    return result
+  })
+
+  on('tool.call', { tool: 'TodoWrite' }, async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && result.deny === undefined && result.isError !== true) {
+      const todo = e.todos.find(t => t.status === 'in_progress')?.activeForm ?? null
+      await update($, workingOn, w => ({ ...w, todo })).catch(() => undefined)
+    }
+    return result
   })
 
   // Each main-loop request carries the effort it asks for, and its response
@@ -243,6 +383,7 @@ export const register: Register = on => {
     const git = await read($, repo)
     const pr = await read($, pullRequest)
     const working = await read($, agents)
+    const activity = workingOnText(await read($, workingOn))
     const newest = list.length - 1
     const percent = top.contextPercent
     const card = git === null ? undefined : /^BL-\d+/i.exec(git.branch)?.[0].toUpperCase()
@@ -343,6 +484,12 @@ export const register: Register = on => {
               </Box>
             ))}
           </Box>
+        )}
+
+        {activity !== null && (
+          <Text color="suggestion" wrap="truncate-end">
+            {activity}
+          </Text>
         )}
 
         <Box flexDirection="column" gap={1}>

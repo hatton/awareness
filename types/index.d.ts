@@ -39,6 +39,23 @@ export type PullRequest = {
   status: string
 } | null
 
+/** One entry of the main conversation's task list, by its id. */
+export type TrackedTask = {
+  /** The present-continuous phrase shown beside the spinner, else the subject. */
+  doing: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
+
+/** What the "Working on:" line is made from. */
+export type WorkingOn = {
+  /** The skill last started, as the person or the model named it. */
+  skill: string | null
+  /** The `TaskCreate`/`TaskUpdate` task list, by task id. */
+  tasks: Readonly<Record<string, TrackedTask>>
+  /** The in-progress item of the last `TodoWrite` list, if any. */
+  todo: string | null
+}
+
 /** A subagent or teammate still at work. */
 export type RunningAgent = { id: string; description: string; type: string }
 
@@ -49,6 +66,7 @@ declare module 'claude-code' {
       header: Header
       repo: Repo
       pullRequest: PullRequest
+      workingOn: WorkingOn
       agents: readonly RunningAgent[]
     }
   }
