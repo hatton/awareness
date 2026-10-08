@@ -1,6 +1,6 @@
 {
   "name": "awareness",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A Claude Code pane showing the model, thinking level, context, usage limits, git state, PR, running agents and your last three prompts.",
   "author": { "name": "John Hatton" },
   "license": "MIT",

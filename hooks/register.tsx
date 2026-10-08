@@ -133,6 +133,14 @@ const refreshRepo = async ($: EngineInterface) => {
 }
 
 /**
+ * Turns a GitHub pull request URL such as
+ * `https://github.com/BloomBooks/BloomDesktop/pull/8315` into its Reviewable
+ * page, `https://reviewable.io/reviews/BloomBooks/BloomDesktop/8315`.
+ */
+export const reviewableUrl = (pullRequestUrl: string) =>
+  pullRequestUrl.replace(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+).*$/, 'https://reviewable.io/reviews/$1/$2/$3')
+
+/**
  * Reads `gh pr view --json number,url,state,isDraft` output into the pull
  * request's state: a draft reads `draft`, otherwise the state in lower case.
  */
@@ -298,6 +306,11 @@ export const register: Register = on => {
                     <Link href={pr.url}>
                       <Text dimColor underline>
                         PR #{pr.number}
+                      </Text>
+                    </Link>
+                    <Link href={reviewableUrl(pr.url)}>
+                      <Text dimColor underline>
+                        Reviewable
                       </Text>
                     </Link>
                     <Text dimColor>({pr.status})</Text>

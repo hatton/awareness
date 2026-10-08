@@ -1,7 +1,7 @@
 import type { On, RenderElement, SiteScroll } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
-import { folderUrl, friendlyModelName, parseGitStatus, parsePullRequest } from '../hooks/register'
+import { folderUrl, friendlyModelName, parseGitStatus, parsePullRequest, reviewableUrl } from '../hooks/register'
 
 /** Stands in for the engine beneath the plugin: prompts pass, the pane body is empty. */
 const answerBottoms = (on: On) => {
@@ -164,9 +164,10 @@ test('shows git state, card link, usage and running agents after a refresh', asy
     'file:///D:/BL-16818-tables',
     'https://issues.bloomlibrary.org/youtrack/issue/BL-16818',
     'https://github.com/BloomBooks/BloomDesktop/pull/8315',
+    'https://reviewable.io/reviews/BloomBooks/BloomDesktop/8315',
   ])
   const underlined = (await ui.findAll({ type: 'Text' })).filter(t => t.props.underline === true)
-  expect(underlined.map(t => t.text)).toEqual(['D:/BL-16818-tables', 'BL-16818', 'PR #8315'])
+  expect(underlined.map(t => t.text)).toEqual(['D:/BL-16818-tables', 'BL-16818', 'PR #8315', 'Reviewable'])
   expect(shown).toContain('(draft)')
   // Above 80% a usage window turns red; below it stays dim.
   expect((await ui.find({ type: 'Text', text: /^ · week 85%$/ }))?.props.color).toBe('error')
@@ -213,4 +214,8 @@ test('every link is underlined and the title is muted and bold', async ($, on) =
 test('turns a Windows folder into a file URL', () => {
   expect(folderUrl('D:\\BL-16818-tables')).toBe('file:///D:/BL-16818-tables')
   expect(folderUrl('/home/me/work')).toBe('file:///home/me/work')
+})
+
+test('turns a pull request URL into its Reviewable page', () => {
+  expect(reviewableUrl('https://github.com/BloomBooks/BloomDesktop/pull/8315')).toBe('https://reviewable.io/reviews/BloomBooks/BloomDesktop/8315')
 })
