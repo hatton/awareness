@@ -191,13 +191,21 @@ const readEffortSetting = async ($: EngineInterface) => {
  */
 export const parseDefaultBranch = (stdout: string) => stdout.trim().replace(/^origin\//, '') || null
 
+/**
+ * Writes a drive path that git gives with forward slashes, `D:/work`, the
+ * Windows way, `D:\work`, which Explorer needs; any other path as it is.
+ */
+export const windowsPath = (path: string) => (/^[A-Za-z]:\//.test(path) ? path.replace(/\//g, '\\') : path)
+
 /** Reads the worktree's branch, the repository's default branch, uncommitted files and unpushed commits. */
 const refreshRepo = async ($: EngineInterface) => {
-  const worktree = await $.session.cwd()
-  const [status, originHead] = await Promise.all([
+  const [status, originHead, topLevel] = await Promise.all([
     $.process.run(['git', 'status', '--porcelain=v2', '--branch'], { timeoutMs: 10_000 }),
     $.process.run(['git', 'rev-parse', '--abbrev-ref', 'origin/HEAD'], { timeoutMs: 10_000 }),
+    $.process.run(['git', 'rev-parse', '--show-toplevel'], { timeoutMs: 10_000 }),
   ])
+  // The session can move into a subfolder; the worktree is the repository's top folder.
+  const worktree = topLevel.exitCode === 0 ? windowsPath(topLevel.stdout.trim()) : await $.session.cwd()
   const defaultBranch = originHead.exitCode === 0 ? parseDefaultBranch(originHead.stdout) : null
   const state: Repo = status.exitCode === 0 ? parseGitStatus(status.stdout, worktree, defaultBranch) : null
   await update($, repo, () => state)
@@ -580,15 +588,22 @@ export const register: Register = (on, options) => {
               </Box>
             )}
             <Box flexDirection="row" gap={1}>
-              <Text dimColor>Workspace:</Text>
-              <Button key="open-folder" plain dimColor onPress={() => openInExplorer($, git.worktree)}>
-                <Text underline wrap="truncate-middle">
-                  {git.worktree}
-                </Text>
-              </Button>
-              <Button key="open-vscode" plain dimColor onPress={() => openInExplorer($, vscodeUrl(git.worktree))}>
-                <Text underline>VSCode</Text>
-              </Button>
+              {/* Only the path gives way to a narrow pane; the label and VSCode keep their width. */}
+              <Box flexShrink={0}>
+                <Text dimColor>Workspace:</Text>
+              </Box>
+              <Box flexShrink={1}>
+                <Button key="open-folder" plain dimColor onPress={() => openInExplorer($, git.worktree)}>
+                  <Text underline wrap="truncate-middle">
+                    {git.worktree}
+                  </Text>
+                </Button>
+              </Box>
+              <Box flexShrink={0}>
+                <Button key="open-vscode" plain dimColor onPress={() => openInExplorer($, vscodeUrl(git.worktree))}>
+                  <Text underline>VSCode</Text>
+                </Button>
+              </Box>
             </Box>
             <Text bold dimColor wrap="truncate-end">
               Branch: {git.branch}

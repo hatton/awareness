@@ -2,7 +2,7 @@ import type { On, RenderElement, SiteScroll } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { cardId, cardWords, friendlyModelName, parseDefaultBranch, parseGitStatus, parsePullRequest, reviewableUrl, skillTitle, tabLabel, tidySummary, typedSkillName, updatedTasks, vscodeUrl, workingOnText } from '../hooks/register'
+import { cardId, cardWords, friendlyModelName, parseDefaultBranch, parseGitStatus, parsePullRequest, reviewableUrl, skillTitle, tabLabel, tidySummary, typedSkillName, updatedTasks, vscodeUrl, windowsPath, workingOnText } from '../hooks/register'
 
 /** Stands in for the engine beneath the plugin: prompts pass, the pane body is empty. */
 const answerBottoms = (on: On) => {
@@ -137,7 +137,8 @@ test('shows git state, card link, usage and running agents after a refresh', asy
   on('session.model', () => ({ value: 'claude-opus-5-5[1m]' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000, percent: 10 }, rateLimits: [{ kind: 'five_hour', percentUsed: 23.5 }, { kind: 'seven_day', percentUsed: 85 }], cost: { totalUsd: 0 } } }) as never)
   on('settings.read', () => ({ value: {} }) as never)
-  on('session.cwd', () => ({ value: 'D:/BL-16818-tables' }) as never)
+  // The session has moved into a subfolder; the pane still shows the worktree's top folder.
+  on('session.cwd', () => ({ value: 'D:/BL-16818-tables/src/deep' }) as never)
   mock.env(on, { YOUTRACK_BOT: 'perm-test' })
   on('http.fetch', ($, e) => {
     expect((e as unknown as { url: string }).url).toBe('https://issues.bloomlibrary.org/youtrack/api/issues/BL-16818?fields=summary')
@@ -150,6 +151,8 @@ test('shows git state, card link, usage and running agents after a refresh', asy
     let stdout = '# branch.head BL-16818-tables\n# branch.ab +1 -0\n? a.txt\n'
     if (argv[0] === 'gh') {
       stdout = JSON.stringify({ number: 8315, url: 'https://github.com/BloomBooks/BloomDesktop/pull/8315', baseRefName: 'Version6.5', state: 'OPEN', isDraft: true })
+    } else if (argv[2] === '--show-toplevel') {
+      stdout = 'D:/BL-16818-tables\n'
     } else if (argv[1] === 'rev-parse') {
       stdout = 'origin/master\n'
     }
@@ -194,12 +197,12 @@ test('shows git state, card link, usage and running agents after a refresh', asy
     'https://reviewable.io/reviews/BloomBooks/BloomDesktop/8315',
   ])
   const underlined = (await ui.findAll({ type: 'Text' })).filter(t => t.props.underline === true)
-  expect(underlined.map(t => t.text)).toEqual(['BL-16818', 'D:/BL-16818-tables', 'VSCode', 'PR #8315', 'Reviewable'])
+  expect(underlined.map(t => t.text)).toEqual(['BL-16818', 'D:\\BL-16818-tables', 'VSCode', 'PR #8315', 'Reviewable'])
   // The folder and VS Code buttons hand the worktree to Explorer.
   await ui.press({ key: 'open-folder' })
   await ui.press({ key: 'open-vscode' })
   expect(runs.filter(a => a[0] === 'explorer.exe')).toEqual([
-    ['explorer.exe', 'D:/BL-16818-tables'],
+    ['explorer.exe', 'D:\\BL-16818-tables'],
     ['explorer.exe', 'vscode://file/D:/BL-16818-tables'],
   ])
   // Above 80% a usage window turns red; below it stays dim.
@@ -219,7 +222,12 @@ test('reads the pull request status, a draft as draft', () => {
 test('every link is underlined and the title is muted and bold', async ($, on) => {
   answerBottoms(on)
   on('session.cwd', () => ({ value: 'D:\\BL-16818-tables' }) as never)
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '# branch.head BL-16818-tables\n', stderr: '' } }) as never)
+  // Outside a git checkout's top folder answer, the session's directory stands in.
+  on('process.run', ($, e) => {
+    const argv = (e as unknown as { argv: string[] }).argv
+    const exitCode = argv[2] === '--show-toplevel' ? 1 : 0
+    return { value: { exitCode, stdout: '# branch.head BL-16818-tables\n', stderr: '' } } as never
+  })
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1 }, rateLimits: [] } }) as never)
   on('settings.read', () => ({ value: {} }) as never)
@@ -241,6 +249,11 @@ test('every link is underlined and the title is muted and bold', async ($, on) =
   const underlined = (await ui.findAll({ type: 'Text' })).filter(t => t.props.underline === true)
   expect(underlined.map(t => t.text)).toEqual(['BL-16818', 'D:\\BL-16818-tables', 'VSCode'])
   await ui.unmount()
+})
+
+test('writes a git drive path the Windows way', () => {
+  expect(windowsPath('D:/BL-16818-tables')).toBe('D:\\BL-16818-tables')
+  expect(windowsPath('/home/me/work')).toBe('/home/me/work')
 })
 
 test('turns a Windows folder into a VS Code URL', () => {
