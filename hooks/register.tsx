@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Header, PullRequest, Recent, Repo, RunningAgent, WorkingOn } from '../types'
+import type { Card, Header, PullRequest, Recent, Repo, RunningAgent, WorkingOn } from '../types'
 
 const SHOWN = 3
 const PANE = 'awareness'
@@ -15,6 +15,12 @@ const REFRESH_MS = 10_000
 // The pull request is read over the network, so less often.
 const PULL_REQUEST_REFRESH_MS = 60_000
 const YOUTRACK_ISSUE_URL = 'https://issues.bloomlibrary.org/youtrack/issue/'
+const YOUTRACK_API_URL = 'https://issues.bloomlibrary.org/youtrack/api/issues/'
+// How many prompts pass before the task summary in an Orca tab's label is asked for again.
+const TAB_SUMMARY_EVERY_TURNS = 5
+const TAB_SUMMARY_PROMPT =
+  'In two or three words, name the task this conversation is working on now, as a label for a terminal tab ' +
+  '(for example "Contentful sponsors" or "Devin fixes"). Reply with only those words.'
 
 // Oldest first, newest last; at most SHOWN entries.
 const recent = atom({ plugin: 'awareness', key: 'recent' } as const, [] as Recent)
@@ -26,6 +32,7 @@ const header = atom({ plugin: 'awareness', key: 'header' } as const, {
 } as Header)
 const repo = atom({ plugin: 'awareness', key: 'repo' } as const, null as Repo)
 const pullRequest = atom({ plugin: 'awareness', key: 'pullRequest' } as const, null as PullRequest)
+const card = atom({ plugin: 'awareness', key: 'card' } as const, null as Card)
 const agents = atom({ plugin: 'awareness', key: 'agents' } as const, [] as readonly RunningAgent[])
 const NOTHING_YET: WorkingOn = { skill: null, tasks: {}, todo: null }
 const workingOn = atom({ plugin: 'awareness', key: 'workingOn' } as const, NOTHING_YET)
@@ -110,7 +117,7 @@ const limitLabel = (kind: string) => {
  * Reads `git status --porcelain=v2 --branch` output into the repo's state.
  * A detached HEAD shows as `(detached)`.
  */
-export const parseGitStatus = (stdout: string, worktree: string): NonNullable<Repo> => {
+export const parseGitStatus = (stdout: string, worktree: string, defaultBranch: string | null): NonNullable<Repo> => {
   let branch = '(detached)'
   let unpushedCommits: number | null = null
   let changedFiles = 0
@@ -124,11 +131,20 @@ export const parseGitStatus = (stdout: string, worktree: string): NonNullable<Re
       changedFiles += 1
     }
   }
-  return { branch, worktree, changedFiles, unpushedCommits }
+  return { branch, defaultBranch, worktree, changedFiles, unpushedCommits }
 }
 
-/** Turns a folder path such as `D:\work` into a `file:///D:/work` URL that opens it. */
-export const folderUrl = (path: string) => `file:///${path.replace(/\\/g, '/').replace(/^\/+/, '')}`
+/** Turns a folder path such as `D:\work` into a `vscode://file/D:/work` URL that opens it in VS Code. */
+export const vscodeUrl = (path: string) => `vscode://file/${path.replace(/\\/g, '/').replace(/^\/+/, '')}`
+
+/**
+ * Hands a folder or a URL to Windows Explorer: a folder opens in Explorer, a
+ * URL in the app registered for its scheme. A terminal opens only some link
+ * schemes itself, so the pane's folder links go this way instead.
+ */
+const openInExplorer = async ($: EngineInterface, target: string) => {
+  await $.process.run(['explorer.exe', target], { timeoutMs: 10_000 })
+}
 
 /** Describes the uncommitted files for the pane. */
 const uncommittedText = (count: number) => {
@@ -169,13 +185,21 @@ const readEffortSetting = async ($: EngineInterface) => {
   await update($, header, h => ({ ...h, effort: String(effortLevel) }))
 }
 
-/** Reads the worktree's branch, uncommitted files and unpushed commits. */
+/**
+ * Reads `git rev-parse --abbrev-ref origin/HEAD` output, `origin/master`,
+ * into the default branch's name, `master`.
+ */
+export const parseDefaultBranch = (stdout: string) => stdout.trim().replace(/^origin\//, '') || null
+
+/** Reads the worktree's branch, the repository's default branch, uncommitted files and unpushed commits. */
 const refreshRepo = async ($: EngineInterface) => {
   const worktree = await $.session.cwd()
-  const { exitCode, stdout } = await $.process.run(['git', 'status', '--porcelain=v2', '--branch'], {
-    timeoutMs: 10_000,
-  })
-  const state: Repo = exitCode === 0 ? parseGitStatus(stdout, worktree) : null
+  const [status, originHead] = await Promise.all([
+    $.process.run(['git', 'status', '--porcelain=v2', '--branch'], { timeoutMs: 10_000 }),
+    $.process.run(['git', 'rev-parse', '--abbrev-ref', 'origin/HEAD'], { timeoutMs: 10_000 }),
+  ])
+  const defaultBranch = originHead.exitCode === 0 ? parseDefaultBranch(originHead.stdout) : null
+  const state: Repo = status.exitCode === 0 ? parseGitStatus(status.stdout, worktree, defaultBranch) : null
   await update($, repo, () => state)
 }
 
@@ -188,23 +212,115 @@ export const reviewableUrl = (pullRequestUrl: string) =>
   pullRequestUrl.replace(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+).*$/, 'https://reviewable.io/reviews/$1/$2/$3')
 
 /**
- * Reads `gh pr view --json number,url,state,isDraft` output into the pull
- * request's state: a draft reads `draft`, otherwise the state in lower case.
+ * Reads `gh pr view --json number,url,baseRefName,state,isDraft` output into
+ * the pull request's state: a draft reads `draft`, otherwise the state in lower case.
  */
 export const parsePullRequest = (stdout: string): NonNullable<PullRequest> => {
-  const pr = JSON.parse(stdout) as { number: number; url: string; state: string; isDraft: boolean }
+  const pr = JSON.parse(stdout) as { number: number; url: string; baseRefName: string; state: string; isDraft: boolean }
   const status = pr.isDraft && pr.state === 'OPEN' ? 'draft' : pr.state.toLowerCase()
-  return { number: pr.number, url: pr.url, status }
+  return { number: pr.number, url: pr.url, base: pr.baseRefName, status }
 }
 
 /** Reads the current branch's pull request through the GitHub CLI. */
 const refreshPullRequest = async ($: EngineInterface) => {
   const { exitCode, stdout } = await $.process.run(
-    ['gh', 'pr', 'view', '--json', 'number,url,state,isDraft'],
+    ['gh', 'pr', 'view', '--json', 'number,url,baseRefName,state,isDraft'],
     { timeoutMs: 20_000 },
   )
   const state: PullRequest = exitCode === 0 ? parsePullRequest(stdout) : null
   await update($, pullRequest, () => state)
+}
+
+/** The YouTrack card id a branch named the team's way starts with, such as `BL-15958`; null without one. */
+export const cardId = (branch: string) => /^BL-\d+/i.exec(branch)?.[0].toUpperCase() ?? null
+
+/**
+ * Reads the summary of the card the branch names from YouTrack, through the
+ * team's Bot token in `YOUTRACK_BOT`. A card already read is not read again.
+ */
+const refreshCard = async ($: EngineInterface) => {
+  const git = await read($, repo)
+  const id = git === null ? null : cardId(git.branch)
+  if (id === null || (await read($, card))?.id === id) {
+    return
+  }
+  const token = await $.env.get('YOUTRACK_BOT')
+  if (!token) {
+    return
+  }
+  const response = await $.http.fetch(`${YOUTRACK_API_URL}${id}?fields=summary`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+  })
+  if (!response.ok) {
+    return
+  }
+  const { summary } = JSON.parse(response.text) as { summary: string }
+  await update($, card, () => ({ id, summary }))
+}
+
+/** Reads what lives on the network, the pull request and the card's summary. */
+const refreshRemote = ($: EngineInterface) => Promise.allSettled([refreshPullRequest($), refreshCard($)])
+
+/**
+ * The words after the card id in a branch named the team's way:
+ * `BL-15958-crop-marks` gives `crop marks`; a branch without a card id, none.
+ */
+export const cardWords = (branch: string) => {
+  const words = /^[A-Za-z]+-\d+[-_](.+)$/.exec(branch)?.[1]?.replace(/[-_]+/g, ' ').trim()
+  return words || null
+}
+
+/** Trims a model's reply to a tab label: one line, no quotes or closing period, at most four words. */
+export const tidySummary = (text: string) =>
+  text
+    .split('\n')[0]!
+    .replace(/["'`*.]/g, '')
+    .trim()
+    .split(/\s+/)
+    .slice(0, 4)
+    .join(' ')
+
+/**
+ * The Orca tab's label: the summary of what the conversation is working on.
+ * The worktree's card can be about something else entirely, so its words
+ * stand in only until the first summary; null when there is neither.
+ */
+export const tabLabel = (words: string | null, task: string | null) => task ?? words
+
+// What this module last asked Orca for, so an unchanged label is not sent again.
+let lastLabel: string | null = null
+let task: string | null = null
+let taskAskedAtTurn = -Infinity
+
+/**
+ * Keeps the Orca terminal tab this session runs in labelled with what it is
+ * about. Outside Orca there is no tab handle and it does nothing.
+ */
+const refreshTabLabel = async ($: EngineInterface) => {
+  const handle = await $.env.get('ORCA_TERMINAL_HANDLE')
+  if (!handle) {
+    return
+  }
+  const branch = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { timeoutMs: 10_000 })
+  const words = branch.exitCode === 0 ? cardWords(branch.stdout.trim()) : null
+  const turns = await $.session.turns()
+  if (turns > 0 && turns - taskAskedAtTurn >= TAB_SUMMARY_EVERY_TURNS) {
+    const reply = await $.model.fork({ prompt: TAB_SUMMARY_PROMPT })
+    if (reply.isAnswered && tidySummary(reply.text)) {
+      task = tidySummary(reply.text)
+      taskAskedAtTurn = turns
+    }
+  }
+  const label = tabLabel(words, task)
+  if (label === null || label === lastLabel) {
+    return
+  }
+  const renamed = await $.process.run(['orca', 'terminal', 'rename', '--terminal', handle, '--title', label], {
+    timeoutMs: 10_000,
+  })
+  if (renamed.exitCode === 0) {
+    lastLabel = label
+  }
 }
 
 /** Reads which subagents and teammates are still at work. */
@@ -265,7 +381,9 @@ const refreshAll = async ($: EngineInterface) => {
   await Promise.allSettled([refreshHeader($), refreshRepo($), refreshAgents($)])
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const labelOrcaTab = options.labelOrcaTab !== false
+
   // Claude Code docks the pane beside the transcript in the fullscreen layout
   // from 110 columns; elsewhere it seats it above the prompt.
   on('session.start', async ($, e, next) => {
@@ -275,9 +393,12 @@ export const register: Register = on => {
     })
     void $.ui.open({ id: PANE, title: TITLE })
     await Promise.allSettled([refreshAll($), readEffortSetting($)])
-    void refreshPullRequest($).catch(() => undefined)
+    void refreshRemote($)
+    if (labelOrcaTab) {
+      void refreshTabLabel($).catch(() => undefined)
+    }
     $.clock.every(REFRESH_MS, () => refreshAll($))
-    $.clock.every(PULL_REQUEST_REFRESH_MS, () => refreshPullRequest($).catch(() => undefined))
+    $.clock.every(PULL_REQUEST_REFRESH_MS, () => refreshRemote($))
 
     return next(e)
   })
@@ -383,12 +504,15 @@ export const register: Register = on => {
       await update($, workingOn, () => NOTHING_YET).catch(() => undefined)
     }
     void refreshAll($)
-    void refreshPullRequest($).catch(() => undefined)
+    void refreshRemote($)
+    if (labelOrcaTab && e.agentId === undefined) {
+      void refreshTabLabel($).catch(() => undefined)
+    }
     return result
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Link } = $.ui.resolve(e)
+    const { Box, Button, Text, Link } = $.ui.resolve(e)
     const list = await read($, recent)
     const top = await read($, header)
     const git = await read($, repo)
@@ -397,7 +521,11 @@ export const register: Register = on => {
     const activity = workingOnText(await read($, workingOn))
     const newest = list.length - 1
     const percent = top.contextPercent
-    const card = git === null ? undefined : /^BL-\d+/i.exec(git.branch)?.[0].toUpperCase()
+    const id = git === null ? null : cardId(git.branch)
+    const known = await read($, card)
+    const summary = known !== null && known.id === id ? known.summary : null
+    // A pull request names the branch it merges into; without one, the repository's default branch stands in.
+    const parent = pr?.base ?? git?.defaultBranch ?? null
 
     return (
       <Box flexDirection="column" gap={1} paddingLeft={2}>
@@ -436,49 +564,66 @@ export const register: Register = on => {
 
         {git !== null && (
           <Box flexDirection="column">
-            <Text bold dimColor wrap="truncate-end">
-              Workspace: {git.branch}
-            </Text>
-            <Link href={folderUrl(git.worktree)}>
-              <Text dimColor underline wrap="truncate-middle">
-                {git.worktree}
-              </Text>
-            </Link>
-            {(card !== undefined || pr !== null) && (
-              <Box flexDirection="row" gap={2}>
-                {card !== undefined && (
-                  <Link href={`${YOUTRACK_ISSUE_URL}${card}`}>
-                    <Text dimColor underline>
-                      {card}
-                    </Text>
-                  </Link>
-                )}
-                {pr !== null && (
-                  <Box flexDirection="row" gap={1}>
-                    <Link href={pr.url}>
-                      <Text dimColor underline>
-                        PR #{pr.number}
-                      </Text>
-                    </Link>
-                    <Link href={reviewableUrl(pr.url)}>
-                      <Text dimColor underline>
-                        Reviewable
-                      </Text>
-                    </Link>
-                    <Text dimColor>({pr.status})</Text>
-                  </Box>
+            {id !== null && (
+              <Box flexDirection="row" gap={1}>
+                <Text dimColor>YouTrack:</Text>
+                <Link href={`${YOUTRACK_ISSUE_URL}${id}`}>
+                  <Text dimColor underline>
+                    {id}
+                  </Text>
+                </Link>
+                {summary !== null && (
+                  <Text dimColor wrap="truncate-end">
+                    {summary}
+                  </Text>
                 )}
               </Box>
             )}
-            <Text color={git.changedFiles > 0 ? 'warning' : undefined} dimColor={git.changedFiles === 0}>
-              {uncommittedText(git.changedFiles)}
+            <Box flexDirection="row" gap={1}>
+              <Text dimColor>Workspace:</Text>
+              <Button key="open-folder" plain dimColor onPress={() => openInExplorer($, git.worktree)}>
+                <Text underline wrap="truncate-middle">
+                  {git.worktree}
+                </Text>
+              </Button>
+              <Button key="open-vscode" plain dimColor onPress={() => openInExplorer($, vscodeUrl(git.worktree))}>
+                <Text underline>VSCode</Text>
+              </Button>
+            </Box>
+            <Text bold dimColor wrap="truncate-end">
+              Branch: {git.branch}
+              {parent === null ? '' : `  Parent: ${parent}`}
             </Text>
-            <Text
-              color={git.unpushedCommits !== 0 ? 'warning' : undefined}
-              dimColor={git.unpushedCommits === 0}
-            >
-              {unpushedText(git.unpushedCommits)}
-            </Text>
+            <Box flexDirection="column" paddingLeft={2}>
+              <Text color={git.changedFiles > 0 ? 'warning' : undefined} dimColor={git.changedFiles === 0}>
+                {uncommittedText(git.changedFiles)}
+              </Text>
+              <Text
+                color={git.unpushedCommits !== 0 ? 'warning' : undefined}
+                dimColor={git.unpushedCommits === 0}
+              >
+                {unpushedText(git.unpushedCommits)}
+              </Text>
+            </Box>
+            {pr === null ? (
+              <Text dimColor>PR: None</Text>
+            ) : (
+              <Box flexDirection="row" gap={4}>
+                <Box flexDirection="row" gap={1}>
+                  <Link href={pr.url}>
+                    <Text dimColor underline>
+                      PR #{pr.number}
+                    </Text>
+                  </Link>
+                  <Text dimColor>into {pr.base}</Text>
+                </Box>
+                <Link href={reviewableUrl(pr.url)}>
+                  <Text dimColor underline>
+                    Reviewable
+                  </Text>
+                </Link>
+              </Box>
+            )}
           </Box>
         )}
 

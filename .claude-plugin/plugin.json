@@ -1,9 +1,17 @@
 {
   "name": "awareness",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "A Claude Code pane showing the model, thinking level, context, usage limits, git state, PR, running agents and your last three prompts.",
   "author": { "name": "John Hatton" },
   "license": "MIT",
   "repository": "https://github.com/hatton/awareness",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "labelOrcaTab": {
+      "type": "boolean",
+      "title": "Label the Orca tab",
+      "description": "In Orca, keep this session's terminal tab labelled with a short summary of what the conversation is working on.",
+      "default": true
+    }
+  }
 }

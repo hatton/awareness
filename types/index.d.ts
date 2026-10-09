@@ -23,6 +23,8 @@ export type Header = {
 /** The git state of the session's worktree; null outside a repository. */
 export type Repo = {
   branch: string
+  /** The repository's default branch, such as `master`; null when `origin/HEAD` is not set. */
+  defaultBranch: string | null
   /** The session's directory. */
   worktree: string
   /** Files with changes not yet committed, untracked ones included. */
@@ -35,8 +37,17 @@ export type Repo = {
 export type PullRequest = {
   number: number
   url: string
+  /** The branch the pull request merges into, such as `master`. */
+  base: string
   /** `draft`, `open`, `merged` or `closed`. */
   status: string
+} | null
+
+/** The YouTrack card the branch names, with its summary once read; null until one is read. */
+export type Card = {
+  /** Such as `BL-15958`. */
+  id: string
+  summary: string
 } | null
 
 /** One entry of the main conversation's task list, by its id. */
@@ -66,6 +77,7 @@ declare module 'claude-code' {
       header: Header
       repo: Repo
       pullRequest: PullRequest
+      card: Card
       workingOn: WorkingOn
       agents: readonly RunningAgent[]
     }

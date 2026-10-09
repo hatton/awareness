@@ -1,7 +1,8 @@
 import type { On, RenderElement, SiteScroll } from 'claude-code'
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 
-import { folderUrl, friendlyModelName, parseGitStatus, parsePullRequest, reviewableUrl, skillTitle, typedSkillName, updatedTasks, workingOnText } from '../hooks/register'
+import { cardId, cardWords, friendlyModelName, parseDefaultBranch, parseGitStatus, parsePullRequest, reviewableUrl, skillTitle, tabLabel, tidySummary, typedSkillName, updatedTasks, vscodeUrl, workingOnText } from '../hooks/register'
 
 /** Stands in for the engine beneath the plugin: prompts pass, the pane body is empty. */
 const answerBottoms = (on: On) => {
@@ -116,9 +117,19 @@ test('takes the thinking level from settings before the first request', async ($
 
 test('reads branch, uncommitted files and unpushed commits from git status', () => {
   const ahead = ['# branch.oid abc', '# branch.head BL-16818-tables', '# branch.upstream origin/BL-16818-tables', '# branch.ab +2 -0', '1 .M N... 100644 100644 100644 a b src/x.ts', '? notes.txt', ''].join('\r\n')
-  expect(parseGitStatus(ahead, 'D:/w')).toEqual({ branch: 'BL-16818-tables', worktree: 'D:/w', changedFiles: 2, unpushedCommits: 2 })
+  expect(parseGitStatus(ahead, 'D:/w', 'master')).toEqual({ branch: 'BL-16818-tables', defaultBranch: 'master', worktree: 'D:/w', changedFiles: 2, unpushedCommits: 2 })
   const noUpstream = ['# branch.oid abc', '# branch.head new-branch', ''].join('\n')
-  expect(parseGitStatus(noUpstream, 'D:/w')).toEqual({ branch: 'new-branch', worktree: 'D:/w', changedFiles: 0, unpushedCommits: null })
+  expect(parseGitStatus(noUpstream, 'D:/w', null)).toEqual({ branch: 'new-branch', defaultBranch: null, worktree: 'D:/w', changedFiles: 0, unpushedCommits: null })
+})
+
+test('reads the default branch from origin/HEAD', () => {
+  expect(parseDefaultBranch('origin/master\n')).toBe('master')
+  expect(parseDefaultBranch('')).toBe(null)
+})
+
+test('takes the card id from the start of the branch name', () => {
+  expect(cardId('bl-16818-tables')).toBe('BL-16818')
+  expect(cardId('new-branch')).toBe(null)
 })
 
 test('shows git state, card link, usage and running agents after a refresh', async ($, on) => {
@@ -127,13 +138,24 @@ test('shows git state, card link, usage and running agents after a refresh', asy
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000, percent: 10 }, rateLimits: [{ kind: 'five_hour', percentUsed: 23.5 }, { kind: 'seven_day', percentUsed: 85 }], cost: { totalUsd: 0 } } }) as never)
   on('settings.read', () => ({ value: {} }) as never)
   on('session.cwd', () => ({ value: 'D:/BL-16818-tables' }) as never)
+  mock.env(on, { YOUTRACK_BOT: 'perm-test' })
+  on('http.fetch', ($, e) => {
+    expect((e as unknown as { url: string }).url).toBe('https://issues.bloomlibrary.org/youtrack/api/issues/BL-16818?fields=summary')
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ summary: 'Fix all the tables' }) } } as never
+  })
+  const runs: string[][] = []
   on('process.run', ($, e) => {
-    const stdout = (e as unknown as { argv: string[] }).argv[0] === 'gh'
-      ? JSON.stringify({ number: 8315, url: 'https://github.com/BloomBooks/BloomDesktop/pull/8315', state: 'OPEN', isDraft: true })
-      : '# branch.head BL-16818-tables\n# branch.ab +1 -0\n? a.txt\n'
+    const argv = (e as unknown as { argv: string[] }).argv
+    runs.push(argv)
+    let stdout = '# branch.head BL-16818-tables\n# branch.ab +1 -0\n? a.txt\n'
+    if (argv[0] === 'gh') {
+      stdout = JSON.stringify({ number: 8315, url: 'https://github.com/BloomBooks/BloomDesktop/pull/8315', baseRefName: 'Version6.5', state: 'OPEN', isDraft: true })
+    } else if (argv[1] === 'rev-parse') {
+      stdout = 'origin/master\n'
+    }
     return { value: { exitCode: 0, stdout, stderr: '' } } as never
   })
-  on('clock.every', () => ({ value: { cancel: () => undefined } }) as never)
+  const clock = mock.clock(on)
   on('agent.list', () => ({ value: [
     { id: 'a1', description: 'Search the tests', type: 'Explore', status: 'running' },
     { id: 'a2', description: 'Old work', type: 'general-purpose', status: 'completed' },
@@ -142,18 +164,24 @@ test('shows git state, card link, usage and running agents after a refresh', asy
   on('ui.open', () => ({ value: { isPlaced: true } }) as never)
   on('session.start', ($, e) => e as never)
   await $.session.start({ source: 'startup', cwd: 'D:/BL-16818-tables' } as never)
+  // The pull request and the card's summary are read unawaited.
+  await clock.settle()
 
   const ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
   const shown = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   expect(shown).toContain('usage: 5-hour 24% · week 85%')
-  expect(shown).toContain('Workspace: BL-16818-tables')
+  // The pull request's base outranks the repository's default branch.
+  expect(shown).toContain('Branch: BL-16818-tables  Parent: Version6.5')
+  expect(shown).toContain('into Version6.5')
+  expect(shown).toContain('Fix all the tables')
+  expect(shown).toContain('Workspace:')
   expect(shown).toContain('1 file uncommitted')
   expect(shown).toContain('1 commit not pushed')
   // Uncommitted files and unpushed commits both turn orange.
   expect((await ui.find({ type: 'Text', text: '1 file uncommitted' }))?.props.color).toBe('warning')
   expect((await ui.find({ type: 'Text', text: '1 commit not pushed' }))?.props.color).toBe('warning')
   // Everything else is muted.
-  for (const muted of ['Awareness Mod', 'Workspace: BL-16818-tables', 'BL-16818', 'PR #8315', 'Running Agents', 'Search the tests (Explore)', 'Recent Prompts']) {
+  for (const muted of ['Awareness Mod', 'YouTrack:', 'BL-16818', 'Fix all the tables', 'Branch: BL-16818-tables  Parent: Version6.5', 'Workspace:', 'PR #8315', 'into Version6.5', 'Running Agents', 'Search the tests (Explore)', 'Recent Prompts']) {
     const found = (await ui.findAll({ type: 'Text' })).find(t => t.text === muted)
     expect([muted, found?.props.dimColor]).toEqual([muted, true])
   }
@@ -161,14 +189,19 @@ test('shows git state, card link, usage and running agents after a refresh', asy
   expect(shown.some(t => t.includes('Old work'))).toBe(false)
   const links = await ui.findAll({ type: 'Link' })
   expect(links.map(l => l.props.href)).toEqual([
-    'file:///D:/BL-16818-tables',
     'https://issues.bloomlibrary.org/youtrack/issue/BL-16818',
     'https://github.com/BloomBooks/BloomDesktop/pull/8315',
     'https://reviewable.io/reviews/BloomBooks/BloomDesktop/8315',
   ])
   const underlined = (await ui.findAll({ type: 'Text' })).filter(t => t.props.underline === true)
-  expect(underlined.map(t => t.text)).toEqual(['D:/BL-16818-tables', 'BL-16818', 'PR #8315', 'Reviewable'])
-  expect(shown).toContain('(draft)')
+  expect(underlined.map(t => t.text)).toEqual(['BL-16818', 'D:/BL-16818-tables', 'VSCode', 'PR #8315', 'Reviewable'])
+  // The folder and VS Code buttons hand the worktree to Explorer.
+  await ui.press({ key: 'open-folder' })
+  await ui.press({ key: 'open-vscode' })
+  expect(runs.filter(a => a[0] === 'explorer.exe')).toEqual([
+    ['explorer.exe', 'D:/BL-16818-tables'],
+    ['explorer.exe', 'vscode://file/D:/BL-16818-tables'],
+  ])
   // Above 80% a usage window turns red; below it stays dim.
   expect((await ui.find({ type: 'Text', text: /^ · week 85%$/ }))?.props.color).toBe('error')
   expect((await ui.find({ type: 'Text', text: /^5-hour 24%$/ }))?.props.dimColor).toBe(true)
@@ -176,8 +209,8 @@ test('shows git state, card link, usage and running agents after a refresh', asy
 })
 
 test('reads the pull request status, a draft as draft', () => {
-  const pr = (state: string, isDraft: boolean) => JSON.stringify({ number: 8315, url: 'u', state, isDraft })
-  expect(parsePullRequest(pr('OPEN', true))).toEqual({ number: 8315, url: 'u', status: 'draft' })
+  const pr = (state: string, isDraft: boolean) => JSON.stringify({ number: 8315, url: 'u', baseRefName: 'master', state, isDraft })
+  expect(parsePullRequest(pr('OPEN', true))).toEqual({ number: 8315, url: 'u', base: 'master', status: 'draft' })
   expect(parsePullRequest(pr('OPEN', false)).status).toBe('open')
   expect(parsePullRequest(pr('MERGED', false)).status).toBe('merged')
   expect(parsePullRequest(pr('CLOSED', true)).status).toBe('closed')
@@ -201,19 +234,18 @@ test('every link is underlined and the title is muted and bold', async ($, on) =
   const title = (await ui.findAll({ type: 'Text' }))[0]
   expect([title?.text, title?.props.bold, title?.props.dimColor]).toEqual(['Awareness Mod', true, true])
   const links = await ui.findAll({ type: 'Link' })
-  expect(links.map(l => l.props.href)).toEqual([
-    'file:///D:/BL-16818-tables',
-    'https://issues.bloomlibrary.org/youtrack/issue/BL-16818',
-  ])
+  expect(links.map(l => l.props.href)).toEqual(['https://issues.bloomlibrary.org/youtrack/issue/BL-16818'])
+  // A branch with no pull request still says so.
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('PR: None')
   // Each link's text is underlined, and nothing else is.
   const underlined = (await ui.findAll({ type: 'Text' })).filter(t => t.props.underline === true)
-  expect(underlined.map(t => t.text)).toEqual(['D:\\BL-16818-tables', 'BL-16818'])
+  expect(underlined.map(t => t.text)).toEqual(['BL-16818', 'D:\\BL-16818-tables', 'VSCode'])
   await ui.unmount()
 })
 
-test('turns a Windows folder into a file URL', () => {
-  expect(folderUrl('D:\\BL-16818-tables')).toBe('file:///D:/BL-16818-tables')
-  expect(folderUrl('/home/me/work')).toBe('file:///home/me/work')
+test('turns a Windows folder into a VS Code URL', () => {
+  expect(vscodeUrl('D:\\BL-16818-tables')).toBe('vscode://file/D:/BL-16818-tables')
+  expect(vscodeUrl('/home/me/work')).toBe('vscode://file/home/me/work')
 })
 
 test('turns a pull request URL into its Reviewable page', () => {
@@ -327,4 +359,55 @@ test('clears the Working on line when the main conversation goes idle, not when 
 
   await $.turn.complete({ turnId: 't2', reason: 'completed', answer: '' } as never)
   expect(await workingLine()).toBeUndefined()
+})
+
+test('takes the words after the card id from a branch name', () => {
+  expect(cardWords('BL-15958-crop-marks')).toBe('crop marks')
+  expect(cardWords('bl-17002-gallery_visuals')).toBe('gallery visuals')
+  expect(cardWords('pull-latest-changes')).toBe(null)
+  expect(cardWords('master')).toBe(null)
+})
+
+test('tidies a model reply into a short label', () => {
+  expect(tidySummary('"Contentful sponsors."\nmore')).toBe('Contentful sponsors')
+  expect(tidySummary('one two three four five')).toBe('one two three four')
+})
+
+test('labels the tab with the task, the card words standing in until there is one', () => {
+  expect(tabLabel('crop marks', 'Awareness mod changes')).toBe('Awareness mod changes')
+  expect(tabLabel('crop marks', null)).toBe('crop marks')
+  expect(tabLabel(null, 'Contentful sponsors')).toBe('Contentful sponsors')
+  expect(tabLabel(null, null)).toBe(null)
+})
+
+/** Runs a main-conversation turn end inside Orca on a card branch and returns the tab renames it asked for. */
+const tabRenamesAfterTurn = async ($: Parameters<TestBody>[0], on: On) => {
+  answerBottoms(on)
+  mock.env(on, { ORCA_TERMINAL_HANDLE: 'term_me' })
+  const renames: string[][] = []
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('session.cwd', () => ({ value: 'D:/BL-15958-crop-marks' }) as never)
+  on('session.turns', () => ({ value: 3 }) as never)
+  on('agent.list', () => ({ value: [] }) as never)
+  // The conversation is about something other than the worktree's card.
+  on('model.fork', () => ({ value: { isAnswered: true, text: 'Awareness mod changes.' } }) as never)
+  on('process.run', ($, e) => {
+    const argv = (e as unknown as { argv: string[] }).argv
+    if (argv[0] === 'orca' && argv[2] === 'rename') {
+      renames.push(argv)
+    }
+    const stdout = argv[0] === 'git' && argv[1] === 'rev-parse' ? 'BL-15958-crop-marks\n' : ''
+    return { value: { exitCode: argv[0] === 'gh' ? 1 : 0, stdout, stderr: '' } } as never
+  })
+  await $.turn.complete({ turnId: 't1', reason: 'completed', answer: '' } as never)
+  await new Promise(resolve => setTimeout(resolve, 50))
+  return renames
+}
+
+test('labels the Orca tab with what the conversation is working on, not the card, when a turn ends', async ($, on) => {
+  expect(await tabRenamesAfterTurn($, on)).toEqual([['orca', 'terminal', 'rename', '--terminal', 'term_me', '--title', 'Awareness mod changes']])
+})
+
+test('leaves the Orca tab alone when the option is off', { options: { labelOrcaTab: false } }, async ($, on) => {
+  expect(await tabRenamesAfterTurn($, on)).toEqual([])
 })
