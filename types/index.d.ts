@@ -39,16 +39,55 @@ export type PullRequest = {
   url: string
   /** The branch the pull request merges into, such as `master`. */
   base: string
+  /** The branch the pull request merges, such as `BL-16822-inline-3-model`. */
+  head: string
+  /** The branch it merges into; the first one's is the branch the whole stack goes into. */
+  base: string
   /** `draft`, `open`, `merged` or `closed`. */
   status: string
 } | null
 
-/** The YouTrack card the branch names, with its summary once read; null until one is read. */
+/** The YouTrack card the branch names, with its summary and state once read; null until one is read. */
 export type Card = {
   /** Such as `BL-15958`. */
   id: string
   summary: string
+  /** The card's State field, such as `Ready For Code Review`; null when it has none. */
+  state: string | null
 } | null
+
+/** One pull request in the stack the branch's pull request belongs to. */
+export type StackEntry = {
+  number: number
+  url: string
+  head: string
+  /** The branch it merges into; the first one's is the branch the whole stack goes into. */
+  base: string
+  /** `draft`, `open`, `merged` or `closed`. */
+  status: string
+}
+
+/**
+ * The pull requests in the branch's pull request's stack, in the order they
+ * merge, merged ones included; empty when it is in no stack.
+ */
+export type Stack = readonly StackEntry[]
+
+/** A worktree on this machine that has a branch checked out. */
+export type CheckedOut = {
+  /** The worktree's top folder, written the Windows way on Windows. */
+  path: string
+  /** The branch's name on the remote, which is what a pull request names. */
+  remoteBranch: string
+  /** How the local branch stands against the remote one: `in sync`, `ahead`, `behind`, `diverged` or `not pushed`. */
+  sync: string
+  /**
+   * What the agents Orca runs in the worktree are doing: `working` when any is,
+   * else `waiting` when any waits on the person; null when none is, or Orca does
+   * not manage the worktree.
+   */
+  agent: string | null
+}
 
 /** One entry of the main conversation's task list, by its id. */
 export type TrackedTask = {
@@ -77,9 +116,11 @@ declare module 'claude-code' {
       header: Header
       repo: Repo
       pullRequest: PullRequest
+      stack: Stack
       card: Card
       workingOn: WorkingOn
       agents: readonly RunningAgent[]
+      checkedOut: readonly CheckedOut[]
     }
   }
 }

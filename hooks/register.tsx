@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Card, Header, PullRequest, Recent, Repo, RunningAgent, WorkingOn } from '../types'
+import type { Card, CheckedOut, Header, PullRequest, Recent, Repo, RunningAgent, Stack, StackEntry, WorkingOn } from '../types'
 
 const SHOWN = 3
 const PANE = 'awareness'
@@ -33,6 +33,8 @@ const header = atom({ plugin: 'awareness', key: 'header' } as const, {
 const repo = atom({ plugin: 'awareness', key: 'repo' } as const, null as Repo)
 const pullRequest = atom({ plugin: 'awareness', key: 'pullRequest' } as const, null as PullRequest)
 const card = atom({ plugin: 'awareness', key: 'card' } as const, null as Card)
+const stack = atom({ plugin: 'awareness', key: 'stack' } as const, [] as Stack)
+const checkedOut = atom({ plugin: 'awareness', key: 'checkedOut' } as const, [] as readonly CheckedOut[])
 const agents = atom({ plugin: 'awareness', key: 'agents' } as const, [] as readonly RunningAgent[])
 const NOTHING_YET: WorkingOn = { skill: null, tasks: {}, todo: null }
 const workingOn = atom({ plugin: 'awareness', key: 'workingOn' } as const, NOTHING_YET)
@@ -220,50 +222,211 @@ export const reviewableUrl = (pullRequestUrl: string) =>
   pullRequestUrl.replace(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+).*$/, 'https://reviewable.io/reviews/$1/$2/$3')
 
 /**
- * Reads `gh pr view --json number,url,baseRefName,state,isDraft` output into
+ * Reads `gh pr view --json number,url,baseRefName,headRefName,state,isDraft` output into
  * the pull request's state: a draft reads `draft`, otherwise the state in lower case.
  */
 export const parsePullRequest = (stdout: string): NonNullable<PullRequest> => {
-  const pr = JSON.parse(stdout) as { number: number; url: string; baseRefName: string; state: string; isDraft: boolean }
-  const status = pr.isDraft && pr.state === 'OPEN' ? 'draft' : pr.state.toLowerCase()
-  return { number: pr.number, url: pr.url, base: pr.baseRefName, status }
+  const pr = JSON.parse(stdout) as GhPullRequest
+  return { number: pr.number, url: pr.url, base: pr.baseRefName, head: pr.headRefName, status: pullRequestStatus(pr) }
 }
 
-/** Reads the current branch's pull request through the GitHub CLI. */
+/** A pull request as `gh` gives it with the fields this module asks for. */
+type GhPullRequest = {
+  number: number
+  url: string
+  baseRefName: string
+  headRefName: string
+  state: string
+  isDraft: boolean
+}
+
+/** A draft reads `draft`, otherwise the state in lower case. */
+const pullRequestStatus = (pr: GhPullRequest) => (pr.isDraft && pr.state === 'OPEN' ? 'draft' : pr.state.toLowerCase())
+
+/**
+ * Finds the stack a branch's pull request is in, from `gh pr list --json
+ * number,url,baseRefName,headRefName,state,isDraft` output of the open pull
+ * requests: below it, the one whose branch it merges into, and that one's, and
+ * so on; above it, the one that merges into its branch, while there is exactly
+ * one. Returned in the order they merge; empty when nothing is chained to it.
+ */
+export const stackOf = (stdout: string, head: string): Stack => {
+  const open = JSON.parse(stdout) as GhPullRequest[]
+  const byHead = new Map(open.map(pr => [pr.headRefName, pr]))
+  const current = byHead.get(head)
+  if (current === undefined) {
+    return []
+  }
+  const chain = [current]
+  const seen = new Set([current.headRefName])
+  for (let below = byHead.get(current.baseRefName); below && !seen.has(below.headRefName); below = byHead.get(below.baseRefName)) {
+    chain.unshift(below)
+    seen.add(below.headRefName)
+  }
+  for (let top = current; ; ) {
+    const above = open.filter(pr => pr.baseRefName === top.headRefName)
+    if (above.length !== 1 || seen.has(above[0]!.headRefName)) {
+      break
+    }
+    top = above[0]!
+    chain.push(top)
+    seen.add(top.headRefName)
+  }
+  if (chain.length < 2) {
+    return []
+  }
+  return chain.map((pr): StackEntry => ({ number: pr.number, url: pr.url, head: pr.headRefName, base: pr.baseRefName, status: pullRequestStatus(pr) }))
+}
+
+/**
+ * Reads `git rev-parse --abbrev-ref @{upstream}` output, `origin/canvas-refit`,
+ * into the branch's name on its remote, `canvas-refit`; null when it is empty.
+ */
+export const parseUpstreamBranch = (stdout: string) => stdout.trim().replace(/^[^/]+\//, '') || null
+
+const pullRequestFields = ['--json', 'number,url,baseRefName,headRefName,state,isDraft']
+
+/**
+ * Reads the current branch's pull request through the GitHub CLI. `gh` finds it
+ * by where the branch pushes, and when the local name differs from the remote one
+ * (Orca names a second worktree of `canvas-refit` `canvas-refit-2`) git cannot say
+ * where that is, so `gh` finds nothing. Then we ask again by the name of the
+ * branch it tracks.
+ */
 const refreshPullRequest = async ($: EngineInterface) => {
-  const { exitCode, stdout } = await $.process.run(
-    ['gh', 'pr', 'view', '--json', 'number,url,baseRefName,state,isDraft'],
-    { timeoutMs: 20_000 },
-  )
+  let { exitCode, stdout } = await $.process.run(['gh', 'pr', 'view', ...pullRequestFields], { timeoutMs: 20_000 })
+  if (exitCode !== 0) {
+    const upstream = await $.process.run(['git', 'rev-parse', '--abbrev-ref', '@{upstream}'], { timeoutMs: 10_000 })
+    const remoteBranch = upstream.exitCode === 0 ? parseUpstreamBranch(upstream.stdout) : null
+    if (remoteBranch !== null) {
+      ;({ exitCode, stdout } = await $.process.run(['gh', 'pr', 'view', remoteBranch, ...pullRequestFields], {
+        timeoutMs: 20_000,
+      }))
+    }
+  }
   const state: PullRequest = exitCode === 0 ? parsePullRequest(stdout) : null
   await update($, pullRequest, () => state)
+  await refreshStack($, state)
+  await refreshCheckedOut($)
+}
+
+const STACK_QUERY =
+  'query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { ' +
+  'stack { entries(first: 100) { nodes { position pullRequest { number url headRefName baseRefName state isDraft } } } } } } }'
+
+/**
+ * Reads GitHub's answer to STACK_QUERY into the stack the pull request is in,
+ * merged pull requests included, in the order they merge; null when GitHub
+ * has it in no stack.
+ */
+export const parseGitHubStack = (stdout: string): Stack | null => {
+  const answer = JSON.parse(stdout) as {
+    data: { repository: { pullRequest: { stack: { entries: { nodes: { position: number; pullRequest: GhPullRequest }[] } } | null } } }
+  }
+  const found = answer.data.repository.pullRequest.stack
+  if (found === null) {
+    return null
+  }
+  return [...found.entries.nodes]
+    .sort((a, b) => a.position - b.position)
+    .map(({ pullRequest: pr }): StackEntry => ({ number: pr.number, url: pr.url, head: pr.headRefName, base: pr.baseRefName, status: pullRequestStatus(pr) }))
+}
+
+/**
+ * Keeps the stack the branch's pull request is in. GitHub's own stack comes
+ * first, since it remembers the pull requests already merged. A pull request
+ * GitHub has in no stack may still be chained to others by their branches,
+ * and those are found from the open pull requests.
+ */
+const refreshStack = async ($: EngineInterface, pr: PullRequest) => {
+  if (pr === null) {
+    await update($, stack, () => [])
+    return
+  }
+  const repoMatch = /github\.com\/([^/]+)\/([^/]+)\/pull\//.exec(pr.url)
+  if (repoMatch) {
+    const asked = await $.process.run(
+      ['gh', 'api', 'graphql', '-f', `query=${STACK_QUERY}`, '-F', `owner=${repoMatch[1]}`, '-F', `repo=${repoMatch[2]}`, '-F', `number=${pr.number}`],
+      { timeoutMs: 20_000 },
+    )
+    const fromGitHub = asked.exitCode === 0 ? parseGitHubStack(asked.stdout) : null
+    if (fromGitHub !== null) {
+      await update($, stack, () => fromGitHub)
+      return
+    }
+  }
+  if (pr.status !== 'open' && pr.status !== 'draft') {
+    await update($, stack, () => [])
+    return
+  }
+  const { exitCode, stdout } = await $.process.run(
+    ['gh', 'pr', 'list', '--state', 'open', '--limit', '200', ...pullRequestFields],
+    { timeoutMs: 20_000 },
+  )
+  if (exitCode !== 0) {
+    return
+  }
+  const found = stackOf(stdout, pr.head)
+  await update($, stack, () => found)
+}
+
+/**
+ * What is wrong with keeping this worktree as it is, for the line under it:
+ * its pull request is already merged or closed, so the folder can go, and its
+ * folder is named for something other than its branch. Empty when neither.
+ */
+export const worktreeWarnings = (worktree: string, branch: string, pullRequestStatus: string | null) => {
+  const warnings: string[] = []
+  if (pullRequestStatus === 'merged' || pullRequestStatus === 'closed') {
+    warnings.push(`PR ${pullRequestStatus}; this worktree can be removed`)
+  }
+  const folder = (worktree.split(/[\\/]/).pop() ?? '').toLowerCase()
+  const name = branch.toLowerCase()
+  if (branch !== '(detached)' && !folder.startsWith(name) && !name.startsWith(folder)) {
+    warnings.push(`folder name is not the branch (${branch})`)
+  }
+  return warnings
 }
 
 /** The YouTrack card id a branch named the team's way starts with, such as `BL-15958`; null without one. */
 export const cardId = (branch: string) => /^BL-\d+/i.exec(branch)?.[0].toUpperCase() ?? null
 
 /**
- * Reads the summary of the card the branch names from YouTrack, through the
- * team's Bot token in `YOUTRACK_BOT`. A card already read is not read again.
+ * Reads YouTrack's answer to `?fields=summary,customFields(name,value(name))`
+ * into the card: its summary, and the name of its State field's value.
+ */
+export const parseCard = (id: string, text: string): NonNullable<Card> => {
+  const issue = JSON.parse(text) as {
+    summary: string
+    customFields?: { name: string; value: { name?: string } | null }[]
+  }
+  const state = issue.customFields?.find(f => f.name === 'State')?.value?.name ?? null
+  return { id, summary: issue.summary, state }
+}
+
+/**
+ * Reads the summary and state of the card the branch names from YouTrack,
+ * through the team's Bot token in `YOUTRACK_BOT`. It is read again on every
+ * refresh, because the card's state moves while the work goes on.
  */
 const refreshCard = async ($: EngineInterface) => {
   const git = await read($, repo)
   const id = git === null ? null : cardId(git.branch)
-  if (id === null || (await read($, card))?.id === id) {
+  if (id === null) {
     return
   }
   const token = await $.env.get('YOUTRACK_BOT')
   if (!token) {
     return
   }
-  const response = await $.http.fetch(`${YOUTRACK_API_URL}${id}?fields=summary`, {
+  const response = await $.http.fetch(`${YOUTRACK_API_URL}${id}?fields=summary,customFields(name,value(name))`, {
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
   })
   if (!response.ok) {
     return
   }
-  const { summary } = JSON.parse(response.text) as { summary: string }
-  await update($, card, () => ({ id, summary }))
+  const latest = parseCard(id, response.text)
+  await update($, card, () => latest)
 }
 
 /** Reads what lives on the network, the pull request and the card's summary. */
@@ -385,8 +548,137 @@ const noteTypedSkill = async ($: EngineInterface, text: string) => {
 }
 
 /** Reads everything the pane shows that can change outside a turn. */
+/**
+ * Reads `git worktree list --porcelain` output into each worktree's folder and
+ * the local branch it has checked out; a detached worktree is left out.
+ */
+export const parseWorktrees = (stdout: string) => {
+  const found: { path: string; branch: string }[] = []
+  let path: string | null = null
+  for (const line of stdout.split(/\r?\n/)) {
+    if (line.startsWith('worktree ')) {
+      path = line.slice('worktree '.length).trim()
+    } else if (line.startsWith('branch refs/heads/') && path !== null) {
+      found.push({ path: windowsPath(path), branch: line.slice('branch refs/heads/'.length).trim() })
+    }
+  }
+  return found
+}
+
+/**
+ * Reads `git for-each-ref --format=%(refname:short)%09%(upstream:short)%09%(upstream:track) refs/heads`
+ * output into each local branch's upstream (the name on the remote, without the remote) and
+ * how it stands against it; a branch with no upstream is left out.
+ */
+export const parseTracking = (stdout: string) => {
+  const found = new Map<string, { remoteBranch: string; sync: string }>()
+  for (const line of stdout.split(/\r?\n/)) {
+    const [branch, upstream, track = ''] = line.split('\t')
+    if (!branch || !upstream) {
+      continue
+    }
+    found.set(branch, { remoteBranch: upstream.replace(/^[^/]+\//, ''), sync: syncFromCounts(track) })
+  }
+  return found
+}
+
+/** Turns git's `[ahead 3, behind 5]`, or the same counts written `ahead 3 behind 5`, into one word. */
+const syncFromCounts = (track: string) => {
+  if (track.includes('gone')) {
+    return 'not pushed'
+  }
+  const ahead = Number(/ahead (\d+)/.exec(track)?.[1] ?? 0)
+  const behind = Number(/behind (\d+)/.exec(track)?.[1] ?? 0)
+  if (ahead > 0 && behind > 0) {
+    return 'diverged'
+  }
+  if (ahead > 0) {
+    return 'ahead'
+  }
+  if (behind > 0) {
+    return 'behind'
+  }
+  return 'in sync'
+}
+
+/**
+ * Finds which worktree on this machine has each of the stack's branches
+ * checked out, and how that branch stands against the remote. A branch with
+ * no upstream is compared with the remote branch of the same name.
+ */
+/**
+ * Reads `orca worktree ps --json` output into what the agents in each Orca
+ * worktree are doing, by the worktree's folder in lower case, written the
+ * Windows way: `working` when any agent is, else `waiting` when any waits on
+ * the person. A worktree whose agents are all done is left out.
+ */
+export const parseOrcaAgents = (stdout: string) => {
+  const answer = JSON.parse(stdout) as { result?: { worktrees?: { path: string; agents?: { state: string }[] }[] } }
+  const found = new Map<string, string>()
+  for (const w of answer.result?.worktrees ?? []) {
+    const states = (w.agents ?? []).map(a => a.state)
+    const agent = states.includes('working') ? 'working' : states.find(s => s !== 'done' && s !== 'working') ? 'waiting' : null
+    if (agent !== null) {
+      found.set(windowsPath(w.path).toLowerCase(), agent)
+    }
+  }
+  return found
+}
+
+/** Asks Orca what its agents are doing; empty when Orca is not running or not installed. */
+const readOrcaAgents = async ($: EngineInterface) => {
+  const ps = await $.process.run(['orca', 'worktree', 'ps', '--json', '--limit', '500'], { timeoutMs: 10_000 }).catch(() => null)
+  if (ps === null || ps.exitCode !== 0) {
+    return new Map<string, string>()
+  }
+  try {
+    return parseOrcaAgents(ps.stdout)
+  } catch {
+    return new Map<string, string>()
+  }
+}
+
+const refreshCheckedOut = async ($: EngineInterface) => {
+  const heads = new Set((await read($, stack)).map(s => s.head))
+  if (heads.size === 0) {
+    await update($, checkedOut, () => [])
+    return
+  }
+  const [list, refs, agentsByPath] = await Promise.all([
+    $.process.run(['git', 'worktree', 'list', '--porcelain'], { timeoutMs: 10_000 }),
+    $.process.run(
+      ['git', 'for-each-ref', '--format=%(refname:short)%09%(upstream:short)%09%(upstream:track)', 'refs/heads'],
+      { timeoutMs: 10_000 },
+    ),
+    readOrcaAgents($),
+  ])
+  if (list.exitCode !== 0 || refs.exitCode !== 0) {
+    return
+  }
+  const tracking = parseTracking(refs.stdout)
+  const found: CheckedOut[] = []
+  for (const { path, branch } of parseWorktrees(list.stdout)) {
+    const tracked = tracking.get(branch)
+    const remoteBranch = tracked?.remoteBranch ?? branch
+    if (!heads.has(remoteBranch)) {
+      continue
+    }
+    let sync = tracked?.sync
+    if (sync === undefined) {
+      const counts = await $.process.run(
+        ['git', 'rev-list', '--left-right', '--count', `refs/heads/${branch}...refs/remotes/origin/${branch}`],
+        { timeoutMs: 10_000 },
+      )
+      const [ahead = '0', behind = '0'] = counts.stdout.trim().split(/\s+/)
+      sync = counts.exitCode === 0 ? syncFromCounts(`ahead ${ahead} behind ${behind}`) : 'not pushed'
+    }
+    found.push({ path, remoteBranch, sync, agent: agentsByPath.get(path.toLowerCase()) ?? null })
+  }
+  await update($, checkedOut, () => found)
+}
+
 const refreshAll = async ($: EngineInterface) => {
-  await Promise.allSettled([refreshHeader($), refreshRepo($), refreshAgents($)])
+  await Promise.allSettled([refreshHeader($), refreshRepo($), refreshAgents($), refreshCheckedOut($)])
 }
 
 export const register: Register = (on, options) => {
@@ -525,21 +817,210 @@ export const register: Register = (on, options) => {
     const top = await read($, header)
     const git = await read($, repo)
     const pr = await read($, pullRequest)
+    const chain = await read($, stack)
+    const worktrees = await read($, checkedOut)
     const working = await read($, agents)
     const activity = workingOnText(await read($, workingOn))
     const newest = list.length - 1
     const percent = top.contextPercent
     const id = git === null ? null : cardId(git.branch)
     const known = await read($, card)
-    const summary = known !== null && known.id === id ? known.summary : null
+    const shown = known !== null && known.id === id ? known : null
     // A pull request names the branch it merges into; without one, the repository's default branch stands in.
     const parent = pr?.base ?? git?.defaultBranch ?? null
 
     return (
-      <Box flexDirection="column" gap={1} paddingLeft={2}>
-        <Text bold dimColor>
-          Awareness Mod
-        </Text>
+      <Box flexDirection="column" gap={1} paddingLeft={2} minHeight={e.props.placement === 'dock' ? e.props.scroll.bodyRows : undefined}>
+        {git !== null && (
+          <Box flexDirection="column">
+            {id !== null && (
+              <Box flexDirection="row" gap={1} marginBottom={1}>
+                {/* Only the summary gives way to a narrow pane; the label and the id keep their width. */}
+                <Box flexShrink={0}>
+                  <Text>Issue:</Text>
+                </Box>
+                <Box flexShrink={0}>
+                  <Link href={`${YOUTRACK_ISSUE_URL}${id}`}>
+                    <Text underline>
+                      {id}
+                    </Text>
+                  </Link>
+                </Box>
+                {/* A long summary gives way so the state after it stays in view. */}
+                {shown !== null && (
+                  <Box flexShrink={1}>
+                    <Text wrap="truncate-end">
+                      {shown.summary}
+                    </Text>
+                  </Box>
+                )}
+                {shown?.state != null && (
+                  <Box flexShrink={0}>
+                    <Text>({shown.state})</Text>
+                  </Box>
+                )}
+              </Box>
+            )}
+            <Box flexDirection="row" gap={1}>
+              {/* Only the path gives way to a narrow pane; the label and VSCode keep their width. */}
+              <Box flexShrink={0}>
+                <Text dimColor>Worktree:</Text>
+              </Box>
+              <Box flexShrink={1}>
+                <Button key="open-folder" plain dimColor onPress={() => openInExplorer($, git.worktree)}>
+                  <Text underline wrap="truncate-middle">
+                    {git.worktree}
+                  </Text>
+                </Button>
+              </Box>
+              <Box flexShrink={0}>
+                <Button key="open-vscode" plain dimColor onPress={() => openInExplorer($, vscodeUrl(git.worktree))}>
+                  <Text underline>VSCode</Text>
+                </Button>
+              </Box>
+            </Box>
+            {worktreeWarnings(git.worktree, git.branch, pr?.status ?? null).map(w => (
+              <Text key={w} color="warning" wrap="truncate-end">
+                {w}
+              </Text>
+            ))}
+            <Text bold dimColor wrap="truncate-end">
+              Branch: {git.branch}
+              {parent === null ? '' : `  Parent: ${parent}`}
+            </Text>
+            <Box flexDirection="column" paddingLeft={2}>
+              <Text color={git.changedFiles > 0 ? 'warning' : undefined} dimColor={git.changedFiles === 0}>
+                {uncommittedText(git.changedFiles)}
+              </Text>
+              <Text
+                color={git.unpushedCommits !== 0 ? 'warning' : undefined}
+                dimColor={git.unpushedCommits === 0}
+              >
+                {unpushedText(git.unpushedCommits)}
+              </Text>
+            </Box>
+            {/* A stack lists the branch's pull request among the others, so the PR line is left out. */}
+            {pr === null && (
+              <Box marginTop={1}>
+                <Text>PR: None</Text>
+              </Box>
+            )}
+            {pr !== null && chain.length === 0 && (
+              <Box flexDirection="row" gap={4} marginTop={1}>
+                <Box flexDirection="row" gap={1}>
+                  <Link href={pr.url}>
+                    <Text underline>
+                      PR #{pr.number}
+                    </Text>
+                  </Link>
+                  <Text>
+                    into {pr.base} ({pr.status})
+                  </Text>
+                </Box>
+                <Link href={reviewableUrl(pr.url)}>
+                  <Text underline>
+                    Reviewable
+                  </Text>
+                </Link>
+              </Box>
+            )}
+            {chain.length > 0 && (
+              <Box flexDirection="column" marginTop={1}>
+                <Text>PR Stack into {chain[0]!.base}</Text>
+                {chain.map((s, i) => (
+                  <Box key={`s${s.number}`} flexDirection="row" gap={1} paddingLeft={2}>
+                    <Text bold={s.number === pr?.number} color={s.number === pr?.number ? 'suggestion' : undefined}>
+                      {i + 1}.
+                    </Text>
+                    <Link href={s.url}>
+                      <Text underline bold={s.number === pr?.number} color={s.number === pr?.number ? 'suggestion' : undefined}>
+                        #{s.number}
+                      </Text>
+                    </Link>
+                    <Box flexShrink={1}>
+                      <Text
+                        wrap="truncate-end"
+                        bold={s.number === pr?.number}
+                        color={s.number === pr?.number ? 'suggestion' : undefined}
+                      >
+                        {cardWords(s.head) ?? s.head}
+                      </Text>
+                    </Box>
+                    {/* The status opens the pull request's Reviewable page. */}
+                    <Box flexShrink={0}>
+                      <Link href={reviewableUrl(s.url)}>
+                        <Text underline bold={s.number === pr?.number} color={s.number === pr?.number ? 'suggestion' : undefined}>
+                          ({s.status})
+                        </Text>
+                      </Link>
+                    </Box>
+                    {/* Where this machine has the branch checked out, and whether it matches the remote. */}
+                    {worktrees
+                      .filter(w => w.remoteBranch === s.head)
+                      .map(w => (
+                        <Box key={`w${w.path}`} flexShrink={0} flexDirection="row" gap={1}>
+                          <Text bold={w.path === git.worktree} color={w.path === git.worktree ? 'suggestion' : undefined}>
+                            {w.path === git.worktree ? '<-- worktree' : w.path}
+                          </Text>
+                          {w.sync !== 'in sync' && <Text color="warning">{w.sync}</Text>}
+                          {w.agent !== null && (
+                            <Text color={w.agent === 'working' ? 'suggestion' : 'warning'}>
+                              {w.agent === 'working' ? 'agent working' : 'agent waiting'}
+                            </Text>
+                          )}
+                        </Box>
+                      ))}
+                  </Box>
+                ))}
+              </Box>
+            )}
+          </Box>
+        )}
+
+        {working.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold dimColor>
+              Running Agents
+            </Text>
+            {working.map(a => (
+              <Box key={a.id} paddingLeft={2}>
+                <Text dimColor wrap="truncate-end">
+                  {a.description} ({a.type})
+                </Text>
+              </Box>
+            ))}
+          </Box>
+        )}
+
+        {activity !== null && (
+          <Text color="suggestion" wrap="truncate-end">
+            {activity}
+          </Text>
+        )}
+
+        {/* Docked, the pane is as tall as its column, and this pushes the prompts and the session's figures to the bottom. */}
+        <Box flexGrow={1} />
+
+        <Box flexDirection="column" gap={1}>
+          <Text bold dimColor>
+            Recent Prompts
+          </Text>
+          {list.length === 0 && <Text dimColor>No prompts yet.</Text>}
+          {list.map((text, i) => (
+            <Box key={`p${i}`} paddingLeft={2}>
+              {i === newest ? (
+                <Text bold color="suggestion" wrap="truncate-end">
+                  {text}
+                </Text>
+              ) : (
+                <Text dimColor wrap="truncate-end">
+                  {text}
+                </Text>
+              )}
+            </Box>
+          ))}
+        </Box>
+
         <Box flexDirection="column">
           <Text wrap="truncate-end">
             <Text dimColor>
@@ -569,116 +1050,10 @@ export const register: Register = (on, options) => {
             </Text>
           )}
         </Box>
-
-        {git !== null && (
-          <Box flexDirection="column">
-            {id !== null && (
-              <Box flexDirection="row" gap={1}>
-                <Text dimColor>YouTrack:</Text>
-                <Link href={`${YOUTRACK_ISSUE_URL}${id}`}>
-                  <Text dimColor underline>
-                    {id}
-                  </Text>
-                </Link>
-                {summary !== null && (
-                  <Text dimColor wrap="truncate-end">
-                    {summary}
-                  </Text>
-                )}
-              </Box>
-            )}
-            <Box flexDirection="row" gap={1}>
-              {/* Only the path gives way to a narrow pane; the label and VSCode keep their width. */}
-              <Box flexShrink={0}>
-                <Text dimColor>Workspace:</Text>
-              </Box>
-              <Box flexShrink={1}>
-                <Button key="open-folder" plain dimColor onPress={() => openInExplorer($, git.worktree)}>
-                  <Text underline wrap="truncate-middle">
-                    {git.worktree}
-                  </Text>
-                </Button>
-              </Box>
-              <Box flexShrink={0}>
-                <Button key="open-vscode" plain dimColor onPress={() => openInExplorer($, vscodeUrl(git.worktree))}>
-                  <Text underline>VSCode</Text>
-                </Button>
-              </Box>
-            </Box>
-            <Text bold dimColor wrap="truncate-end">
-              Branch: {git.branch}
-              {parent === null ? '' : `  Parent: ${parent}`}
-            </Text>
-            <Box flexDirection="column" paddingLeft={2}>
-              <Text color={git.changedFiles > 0 ? 'warning' : undefined} dimColor={git.changedFiles === 0}>
-                {uncommittedText(git.changedFiles)}
-              </Text>
-              <Text
-                color={git.unpushedCommits !== 0 ? 'warning' : undefined}
-                dimColor={git.unpushedCommits === 0}
-              >
-                {unpushedText(git.unpushedCommits)}
-              </Text>
-            </Box>
-            {pr === null ? (
-              <Text dimColor>PR: None</Text>
-            ) : (
-              <Box flexDirection="row" gap={4}>
-                <Box flexDirection="row" gap={1}>
-                  <Link href={pr.url}>
-                    <Text dimColor underline>
-                      PR #{pr.number}
-                    </Text>
-                  </Link>
-                  <Text dimColor>into {pr.base}</Text>
-                </Box>
-                <Link href={reviewableUrl(pr.url)}>
-                  <Text dimColor underline>
-                    Reviewable
-                  </Text>
-                </Link>
-              </Box>
-            )}
-          </Box>
-        )}
-
-        {working.length > 0 && (
-          <Box flexDirection="column">
-            <Text bold dimColor>
-              Running Agents
-            </Text>
-            {working.map(a => (
-              <Box key={a.id} paddingLeft={2}>
-                <Text dimColor wrap="truncate-end">
-                  {a.description} ({a.type})
-                </Text>
-              </Box>
-            ))}
-          </Box>
-        )}
-
-        {activity !== null && (
-          <Text color="suggestion" wrap="truncate-end">
-            {activity}
-          </Text>
-        )}
-
-        <Box flexDirection="column" gap={1}>
+        <Box justifyContent="flex-end">
           <Text bold dimColor>
-            Recent Prompts
+            Awareness Mod
           </Text>
-          {list.length === 0 && <Text dimColor>No prompts yet.</Text>}
-          {list.map((text, i) => (
-            <Box key={`p${i}`} paddingLeft={2}>
-              {i === newest ? (
-                <Text bold color="suggestion">
-                  {text}
-                </Text>
-              ) : (
-                <Text dimColor>{text}</Text>
-              )}
-            </Box>
-          ))}
         </Box>
       </Box>
     )

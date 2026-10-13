@@ -2,7 +2,7 @@ import type { On, RenderElement, SiteScroll } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { cardId, cardWords, friendlyModelName, parseDefaultBranch, parseGitStatus, parsePullRequest, reviewableUrl, skillTitle, tabLabel, tidySummary, typedSkillName, updatedTasks, vscodeUrl, windowsPath, workingOnText } from '../hooks/register'
+import { cardId, cardWords, parseCard, parseGitHubStack, parseOrcaAgents, worktreeWarnings, parseTracking, parseWorktrees, stackOf, friendlyModelName, parseDefaultBranch, parseGitStatus, parsePullRequest, parseUpstreamBranch, reviewableUrl, skillTitle, tabLabel, tidySummary, typedSkillName, updatedTasks, vscodeUrl, windowsPath, workingOnText } from '../hooks/register'
 
 /** Stands in for the engine beneath the plugin: prompts pass, the pane body is empty. */
 const answerBottoms = (on: On) => {
@@ -12,11 +12,6 @@ const answerBottoms = (on: On) => {
     return h(Box, { key: 'engine' }) as RenderElement
   })
 }
-
-// The title draws one Text element, the status line three (the line, its dim
-// part, the context figure) and the "Recent Prompts" heading one more; the
-// prompts follow.
-const HEADER_TEXTS = 5
 
 const SCROLL: SiteScroll = { offset: 0, bodyRows: 30 }
 
@@ -50,11 +45,15 @@ test('shows the last three typed prompts, newest highlighted', async ($, on) => 
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'awareness', surface, ...PANE })
-    const rows = (await ui.findAll({ type: 'Text' })).slice(HEADER_TEXTS)
+    const texts = await ui.findAll({ type: 'Text' })
+    const heading = texts.findIndex(t => t.text === 'Recent Prompts')
+    const rows = texts.slice(heading + 1, heading + 4)
     expect(rows.map(r => r.text)).toEqual(['second line two', 'third', 'fourth'])
     expect(rows[2]?.props.bold).toBe(true)
     expect(rows[0]?.props.dimColor).toBe(true)
     expect(rows[1]?.props.dimColor).toBe(true)
+    // Each prompt takes one line, cut short with an ellipsis when it is long.
+    expect(rows.map(r => r.props.wrap)).toEqual(['truncate-end', 'truncate-end', 'truncate-end'])
     await ui.unmount()
   }
 })
@@ -62,7 +61,8 @@ test('shows the last three typed prompts, newest highlighted', async ($, on) => 
 test('says there are no prompts before the first one', async ($, on) => {
   answerBottoms(on)
   const ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
-  expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('Awareness Mod')
+  // The title is the pane's last line.
+  expect((await ui.findAll({ type: 'Text' })).at(-1)?.text).toBe('Awareness Mod')
   expect(await ui.find({ type: 'Text', text: 'Recent Prompts' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'No prompts yet.' })).toBeDefined()
   await ui.unmount()
@@ -91,8 +91,8 @@ for (const [percent, isRed] of [
 
     const ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
     const texts = await ui.findAll({ type: 'Text' })
-    expect(texts[1]?.text).toBe(`Opus 5.5 (1M context) (medium) | context: ${percent}%`)
-    const ctx = texts[3]
+    expect(texts.find(t => t.text.startsWith('Opus'))?.text).toBe(`Opus 5.5 (1M context) (medium) | context: ${percent}%`)
+    const ctx = texts.find(t => t.text === `${percent}%`)
     expect(ctx?.text).toBe(`${percent}%`)
     expect(ctx?.props.color).toBe(isRed ? 'error' : undefined)
     await ui.unmount()
@@ -111,7 +111,7 @@ test('takes the thinking level from settings before the first request', async ($
 
   const ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
   const texts = await ui.findAll({ type: 'Text' })
-  expect(texts[1]?.text).toBe('Opus 5.5 (1M context) (high) | context: …')
+  expect(texts.find(t => t.text.startsWith('Opus'))?.text).toBe('Opus 5.5 (1M context) (high) | context: …')
   await ui.unmount()
 })
 
@@ -141,8 +141,9 @@ test('shows git state, card link, usage and running agents after a refresh', asy
   on('session.cwd', () => ({ value: 'D:/BL-16818-tables/src/deep' }) as never)
   mock.env(on, { YOUTRACK_BOT: 'perm-test' })
   on('http.fetch', ($, e) => {
-    expect((e as unknown as { url: string }).url).toBe('https://issues.bloomlibrary.org/youtrack/api/issues/BL-16818?fields=summary')
-    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ summary: 'Fix all the tables' }) } } as never
+    expect((e as unknown as { url: string }).url).toBe('https://issues.bloomlibrary.org/youtrack/api/issues/BL-16818?fields=summary,customFields(name,value(name))')
+    const text = JSON.stringify({ summary: 'Fix all the tables', customFields: [{ name: 'Type', value: { name: 'Bug' } }, { name: 'State', value: { name: 'Ready for Review' } }] })
+    return { value: { status: 200, ok: true, headers: {}, text } } as never
   })
   const runs: string[][] = []
   on('process.run', ($, e) => {
@@ -175,18 +176,24 @@ test('shows git state, card link, usage and running agents after a refresh', asy
   expect(shown).toContain('usage: 5-hour 24% · week 85%')
   // The pull request's base outranks the repository's default branch.
   expect(shown).toContain('Branch: BL-16818-tables  Parent: Version6.5')
-  expect(shown).toContain('into Version6.5')
+  expect(shown).toContain('into Version6.5 (draft)')
   expect(shown).toContain('Fix all the tables')
-  expect(shown).toContain('Workspace:')
+  expect(shown).toContain('(Ready for Review)')
+  expect(shown).toContain('Worktree:')
   expect(shown).toContain('1 file uncommitted')
   expect(shown).toContain('1 commit not pushed')
   // Uncommitted files and unpushed commits both turn orange.
   expect((await ui.find({ type: 'Text', text: '1 file uncommitted' }))?.props.color).toBe('warning')
   expect((await ui.find({ type: 'Text', text: '1 commit not pushed' }))?.props.color).toBe('warning')
   // Everything else is muted.
-  for (const muted of ['Awareness Mod', 'YouTrack:', 'BL-16818', 'Fix all the tables', 'Branch: BL-16818-tables  Parent: Version6.5', 'Workspace:', 'PR #8315', 'into Version6.5', 'Running Agents', 'Search the tests (Explore)', 'Recent Prompts']) {
+  for (const muted of ['Awareness Mod', 'Branch: BL-16818-tables  Parent: Version6.5', 'Worktree:', 'Running Agents', 'Search the tests (Explore)', 'Recent Prompts']) {
     const found = (await ui.findAll({ type: 'Text' })).find(t => t.text === muted)
     expect([muted, found?.props.dimColor]).toEqual([muted, true])
+  }
+  // The issue and PR lines are in the normal text color, not muted.
+  for (const plain of ['Issue:', 'BL-16818', 'Fix all the tables', '(Ready for Review)', 'PR #8315', 'into Version6.5 (draft)', 'Reviewable']) {
+    const found = (await ui.findAll({ type: 'Text' })).find(t => t.text === plain)
+    expect([plain, found === undefined, found?.props.dimColor, found?.props.color]).toEqual([plain, false, undefined, undefined])
   }
   expect(shown).toContain('Search the tests (Explore)')
   expect(shown.some(t => t.includes('Old work'))).toBe(false)
@@ -209,6 +216,84 @@ test('shows git state, card link, usage and running agents after a refresh', asy
   expect((await ui.find({ type: 'Text', text: /^ · week 85%$/ }))?.props.color).toBe('error')
   expect((await ui.find({ type: 'Text', text: /^5-hour 24%$/ }))?.props.dimColor).toBe(true)
   await ui.unmount()
+})
+
+test("reads a card's summary and the name of its State field", () => {
+  const card = (fields: unknown) => JSON.stringify({ summary: 'inline images', customFields: fields })
+  expect(parseCard('BL-16822', card([{ name: 'Severity', value: { name: 'Normal' } }, { name: 'State', value: { name: 'Ready For Code Review' } }]))).toEqual({ id: 'BL-16822', summary: 'inline images', state: 'Ready For Code Review' })
+  expect(parseCard('BL-16822', card([{ name: 'State', value: null }])).state).toBe(null)
+  expect(parseCard('BL-16822', card([])).state).toBe(null)
+})
+
+test('warns about a worktree whose PR is done or whose folder is not named for its branch', () => {
+  expect(worktreeWarnings('D:\\BL-16822-inline-3-model', 'BL-16822-inline-3-model', 'open')).toEqual([])
+  // Orca names a second worktree of a branch with a suffix; that still counts as named for it.
+  expect(worktreeWarnings('D:\\canvas-refit-2', 'canvas-refit', 'draft')).toEqual([])
+  expect(worktreeWarnings('D:/BL16822-1', 'BL-16822-inline-2-book-css', 'merged')).toEqual([
+    'PR merged; this worktree can be removed',
+    'folder name is not the branch (BL-16822-inline-2-book-css)',
+  ])
+  expect(worktreeWarnings('C:\\upd6', '(detached)', null)).toEqual([])
+})
+
+test('reads what the agents in each Orca worktree are doing', () => {
+  const ps = JSON.stringify({ result: { worktrees: [
+    { path: 'D:/BL16822-1', agents: [{ state: 'done' }, { state: 'working' }] },
+    { path: 'D:/asks', agents: [{ state: 'blocked' }] },
+    { path: 'D:/finished', agents: [{ state: 'done' }] },
+    { path: 'D:/none' },
+  ] } })
+  expect([...parseOrcaAgents(ps).entries()]).toEqual([
+    ['d:\\bl16822-1', 'working'],
+    ['d:\\asks', 'waiting'],
+  ])
+})
+
+test('reads which branch each worktree has checked out, leaving out detached ones', () => {
+  const porcelain = ['worktree D:/bloom', 'HEAD 1', 'branch refs/heads/master', '', 'worktree C:/upd6', 'HEAD 2', 'detached', '', 'worktree D:/w8321', 'HEAD 3', 'branch refs/heads/BL-1-part-4', ''].join('\n')
+  expect(parseWorktrees(porcelain)).toEqual([
+    { path: 'D:\\bloom', branch: 'master' },
+    { path: 'D:\\w8321', branch: 'BL-1-part-4' },
+  ])
+})
+
+test('reads how each branch stands against its upstream', () => {
+  const refs = ['in-sync\torigin/in-sync\t', 'mine\torigin/theirs\t[ahead 3, behind 5]', 'ahead\torigin/ahead\t[ahead 2]', 'behind\torigin/behind\t[behind 1]', 'gone\torigin/gone\t[gone]', 'local-only\t\t'].join('\n')
+  const tracking = parseTracking(refs)
+  expect([...tracking.entries()]).toEqual([
+    ['in-sync', { remoteBranch: 'in-sync', sync: 'in sync' }],
+    ['mine', { remoteBranch: 'theirs', sync: 'diverged' }],
+    ['ahead', { remoteBranch: 'ahead', sync: 'ahead' }],
+    ['behind', { remoteBranch: 'behind', sync: 'behind' }],
+    ['gone', { remoteBranch: 'gone', sync: 'not pushed' }],
+  ])
+})
+
+test("reads GitHub's stack in position order, merged pull requests included", () => {
+  const entry = (position: number, number: number, state: string, isDraft = false) => ({ position, pullRequest: { number, url: `u${number}`, headRefName: `part-${position}`, baseRefName: 'x', state, isDraft } })
+  const answer = (stack: unknown) => JSON.stringify({ data: { repository: { pullRequest: { stack } } } })
+  const found = parseGitHubStack(answer({ entries: { nodes: [entry(2, 8319, 'OPEN'), entry(1, 8318, 'MERGED'), entry(3, 8320, 'OPEN', true)] } }))
+  expect(found?.map(s => [s.number, s.head, s.status])).toEqual([[8318, 'part-1', 'merged'], [8319, 'part-2', 'open'], [8320, 'part-3', 'draft']])
+  expect(parseGitHubStack(answer(null))).toBe(null)
+})
+
+test('finds the stack of open pull requests a branch is in, in merge order', () => {
+  const pr = (number: number, head: string, base: string, isDraft = false) => ({ number, url: `u${number}`, headRefName: head, baseRefName: base, state: 'OPEN', isDraft })
+  const open = JSON.stringify([
+    pr(3, 'part-3', 'part-2', true),
+    pr(1, 'part-1', 'master'),
+    pr(2, 'part-2', 'part-1'),
+    pr(9, 'other', 'master'),
+  ])
+  expect(stackOf(open, 'part-2').map(s => [s.number, s.status])).toEqual([[1, 'open'], [2, 'open'], [3, 'draft']])
+  expect(stackOf(open, 'part-3').map(s => s.number)).toEqual([1, 2, 3])
+  // A pull request with nothing chained to it is no stack.
+  expect(stackOf(open, 'other')).toEqual([])
+  expect(stackOf(open, 'missing')).toEqual([])
+  // Two pull requests on the same branch: the stack stops below the fork.
+  const forked = JSON.stringify([pr(1, 'a', 'master'), pr(2, 'b', 'a'), pr(3, 'c', 'a')])
+  expect(stackOf(forked, 'a')).toEqual([])
+  expect(stackOf(forked, 'b').map(s => s.number)).toEqual([1, 2])
 })
 
 test('reads the pull request status, a draft as draft', () => {
@@ -239,7 +324,7 @@ test('every link is underlined and the title is muted and bold', async ($, on) =
   await $.session.start({ source: 'startup', cwd: 'D:\\BL-16818-tables' } as never)
 
   const ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
-  const title = (await ui.findAll({ type: 'Text' }))[0]
+  const title = (await ui.findAll({ type: 'Text' })).at(-1)
   expect([title?.text, title?.props.bold, title?.props.dimColor]).toEqual(['Awareness Mod', true, true])
   const links = await ui.findAll({ type: 'Link' })
   expect(links.map(l => l.props.href)).toEqual(['https://issues.bloomlibrary.org/youtrack/issue/BL-16818'])
@@ -248,6 +333,48 @@ test('every link is underlined and the title is muted and bold', async ($, on) =
   // Each link's text is underlined, and nothing else is.
   const underlined = (await ui.findAll({ type: 'Text' })).filter(t => t.props.underline === true)
   expect(underlined.map(t => t.text)).toEqual(['BL-16818', 'D:\\BL-16818-tables', 'VSCode'])
+  await ui.unmount()
+})
+
+test('reads the name a branch has on its remote', () => {
+  expect(parseUpstreamBranch('origin/canvas-refit\n')).toBe('canvas-refit')
+  expect(parseUpstreamBranch('fork/BL-16818-tables/part-2\n')).toBe('BL-16818-tables/part-2')
+  expect(parseUpstreamBranch('')).toBe(null)
+})
+
+test('finds the pull request by the tracked branch when the local name differs', async ($, on) => {
+  answerBottoms(on)
+  on('session.cwd', () => ({ value: 'D:/canvas-refit-3' }) as never)
+  const ghCalls: string[][] = []
+  on('process.run', ($, e) => {
+    const argv = (e as unknown as { argv: string[] }).argv
+    if (argv[0] === 'gh') {
+      ghCalls.push(argv)
+      // gh cannot tell where canvas-refit-3 pushes, so a bare `gh pr view` finds nothing.
+      if (argv[3] !== 'canvas-refit') return { value: { exitCode: 1, stdout: '', stderr: 'no pull requests found' } } as never
+      const stdout = JSON.stringify({ number: 8312, url: 'https://github.com/BloomBooks/BloomDesktop/pull/8312', baseRefName: 'master', state: 'OPEN', isDraft: true })
+      return { value: { exitCode: 0, stdout, stderr: '' } } as never
+    }
+    let stdout = '# branch.head canvas-refit-3\n'
+    if (argv[3] === '@{upstream}') stdout = 'origin/canvas-refit\n'
+    else if (argv[2] === '--show-toplevel') stdout = 'D:/canvas-refit-3\n'
+    return { value: { exitCode: 0, stdout, stderr: '' } } as never
+  })
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1 }, rateLimits: [] } }) as never)
+  on('settings.read', () => ({ value: {} }) as never)
+  on('agent.list', () => ({ value: [] }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  const clock = mock.clock(on)
+  on('session.start', ($, e) => e as never)
+  await $.session.start({ source: 'startup', cwd: 'D:/canvas-refit-3' } as never)
+  await clock.settle()
+
+  expect(ghCalls.filter(a => a[2] === 'view').map(a => a[3])).toEqual(['--json', 'canvas-refit'])
+  const ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
+  const links = await ui.findAll({ type: 'Link' })
+  expect(links.map(l => l.props.href)).toContain('https://github.com/BloomBooks/BloomDesktop/pull/8312')
   await ui.unmount()
 })
 
