@@ -2,7 +2,7 @@ import type { On, RenderElement, SiteScroll } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { cardId, cardWords, parseCard, parseGitHubStack, parseOrcaAgents, worktreeWarnings, parseTracking, parseWorktrees, stackOf, friendlyModelName, parseDefaultBranch, parseGitStatus, parsePullRequest, parseUpstreamBranch, reviewableUrl, skillTitle, tabLabel, tidySummary, typedSkillName, updatedTasks, vscodeUrl, windowsPath, workingOnText } from '../hooks/register'
+import { cardId, cardWords, parseCard, parseOrcaTerminal, siblingFolder, parseGitHubStack, parseOrcaAgents, worktreeWarnings, parseTracking, parseWorktrees, stackOf, friendlyModelName, parseDefaultBranch, parseGitStatus, parsePullRequest, parseUpstreamBranch, reviewableUrl, skillTitle, tabLabel, tidySummary, typedSkillName, updatedTasks, vscodeUrl, windowsPath, workingOnText } from '../hooks/register'
 
 /** Stands in for the engine beneath the plugin: prompts pass, the pane body is empty. */
 const answerBottoms = (on: On) => {
@@ -550,4 +550,76 @@ test('labels the Orca tab with what the conversation is working on, not the card
 
 test('leaves the Orca tab alone when the option is off', { options: { labelOrcaTab: false } }, async ($, on) => {
   expect(await tabRenamesAfterTurn($, on)).toEqual([])
+})
+
+test('picks the terminal an agent runs in to show a worktree, else the first', () => {
+  const list = (terminals: unknown[]) => JSON.stringify({ ok: true, result: { terminals } })
+  expect(parseOrcaTerminal(list([{ handle: 'term_shell', agentIdentity: null }, { handle: 'term_agent', agentIdentity: 'claude' }]))).toBe('term_agent')
+  expect(parseOrcaTerminal(list([{ handle: 'term_shell' }, { handle: 'term_other' }]))).toBe('term_shell')
+  expect(parseOrcaTerminal(list([]))).toBe(null)
+})
+
+test('names a folder beside the worktree', () => {
+  expect(siblingFolder('D:\\BL16822-1', 'BL-1-part-4')).toBe('D:\\BL-1-part-4')
+  expect(siblingFolder('D:\\work\\here\\', 'part-3')).toBe('D:\\work\\part-3')
+})
+
+test('each stacked PR links to its worktree, or offers to make one', async ($, on) => {
+  answerBottoms(on)
+  on('session.cwd', () => ({ value: 'D:/w/here' }) as never)
+  const pr = (number: number, head: string, base: string, isDraft = false) => ({ number, url: `https://github.com/o/r/pull/${number}`, headRefName: head, baseRefName: base, state: 'OPEN', isDraft })
+  const runs: string[][] = []
+  on('process.run', ($, e) => {
+    const argv = (e as unknown as { argv: string[] }).argv
+    runs.push(argv)
+    const answer = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '' } }) as never
+    const command = argv.slice(0, 3).join(' ')
+    if (command === 'gh pr view') return answer(JSON.stringify(pr(2, 'part-2', 'part-1')))
+    if (command === 'gh pr list') return answer(JSON.stringify([pr(1, 'part-1', 'master'), pr(2, 'part-2', 'part-1'), pr(3, 'part-3', 'part-2', true)]))
+    if (argv[0] === 'gh') return answer('', 1)
+    if (command === 'git worktree list') return answer(['worktree D:/w/here', 'branch refs/heads/part-2', '', 'worktree D:/w/part-1', 'branch refs/heads/part-1', ''].join('\n'))
+    if (command === 'git for-each-ref --format=%(refname:short)%09%(upstream:short)%09%(upstream:track)') return answer('part-1\torigin/part-1\t\npart-2\torigin/part-2\t\n')
+    if (command === 'orca terminal list') return answer(JSON.stringify({ result: { terminals: [{ handle: 'term_agent', agentIdentity: 'claude' }] } }))
+    if (argv[0] === 'orca' && argv[1] === 'worktree') return answer('', 1)
+    if (argv[2] === '--show-toplevel') return answer('D:/w/here\n')
+    return answer('# branch.head part-2\n')
+  })
+  on('fs.exists', () => ({ value: false }) as never)
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1 }, rateLimits: [] } }) as never)
+  on('settings.read', () => ({ value: {} }) as never)
+  on('agent.list', () => ({ value: [] }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  const clock = mock.clock(on)
+  on('session.start', ($, e) => e as never)
+  await $.session.start({ source: 'startup', cwd: 'D:/w/here' } as never)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ plugin: 'awareness', surface: 'terminal', ...PANE })
+  const shown = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(shown).toContain('<-- you are here')
+  expect(shown).toContain('worktree')
+  expect(shown).toContain('create worktree')
+  // A draft's status takes the current pull request's color; an open one other than the current stays plain.
+  expect((await ui.find({ type: 'Text', text: '(draft)' }))?.props.color).toBe('suggestion')
+  const statuses = (await ui.findAll({ type: 'Text' })).filter(t => t.text === '(open)')
+  expect(statuses.map(t => t.props.color)).toEqual([undefined, 'suggestion'])
+  expect(shown.some(t => t.includes('D:\\w\\part-1'))).toBe(false)
+
+  await ui.press({ key: 'goD:\\w\\part-1' })
+  expect(runs.filter(a => a[0] === 'orca' && a[1] === 'terminal')).toEqual([
+    ['orca', 'terminal', 'list', '--worktree', 'path:D:/w/part-1', '--json'],
+    ['orca', 'terminal', 'switch', '--terminal', 'term_agent', '--json'],
+  ])
+
+  runs.length = 0
+  await ui.press({ key: 'makepart-3' })
+  await clock.settle()
+  expect(runs.filter(a => a[0] === 'git' && (a[1] === 'fetch' || a[1] === 'worktree') && a[2] !== 'list')).toEqual([
+    ['git', 'fetch', 'origin', 'part-3'],
+    ['git', 'worktree', 'add', 'D:\\w\\part-3', 'part-3'],
+  ])
+  expect(runs.filter(a => a[0] === 'orca' && a[1] === 'terminal').map(a => a[2])).toEqual(['list', 'switch'])
+  await ui.unmount()
 })

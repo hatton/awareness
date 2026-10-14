@@ -35,6 +35,8 @@ const pullRequest = atom({ plugin: 'awareness', key: 'pullRequest' } as const, n
 const card = atom({ plugin: 'awareness', key: 'card' } as const, null as Card)
 const stack = atom({ plugin: 'awareness', key: 'stack' } as const, [] as Stack)
 const checkedOut = atom({ plugin: 'awareness', key: 'checkedOut' } as const, [] as readonly CheckedOut[])
+// The branches a worktree is being made for, so their rows say so until it exists.
+const creating = atom({ plugin: 'awareness', key: 'creating' } as const, [] as readonly string[])
 const agents = atom({ plugin: 'awareness', key: 'agents' } as const, [] as readonly RunningAgent[])
 const NOTHING_YET: WorkingOn = { skill: null, tasks: {}, todo: null }
 const workingOn = atom({ plugin: 'awareness', key: 'workingOn' } as const, NOTHING_YET)
@@ -677,6 +679,67 @@ const refreshCheckedOut = async ($: EngineInterface) => {
   await update($, checkedOut, () => found)
 }
 
+/**
+ * Reads `orca terminal list --worktree <selector> --json` output into the
+ * handle of the terminal to show for that worktree: the first one an agent
+ * runs in, else the first one; null when the worktree has none.
+ */
+export const parseOrcaTerminal = (stdout: string) => {
+  const answer = JSON.parse(stdout) as { result?: { terminals?: { handle: string; agentIdentity?: string | null }[] } }
+  const terminals = answer.result?.terminals ?? []
+  return (terminals.find(t => t.agentIdentity) ?? terminals[0])?.handle ?? null
+}
+
+/**
+ * Names a folder beside the worktree's top folder: `D:\BL16822-1` with
+ * `BL-1-part-4` gives `D:\BL-1-part-4`. That is where Orca puts the
+ * worktrees it makes.
+ */
+export const siblingFolder = (worktree: string, name: string) => worktree.replace(/[^\\/]+[\\/]*$/, '') + name
+
+/**
+ * Brings Orca's window to a worktree, on the tab of the agent working there
+ * if there is one; a worktree with no terminal gets a new one.
+ */
+const goToWorktree = async ($: EngineInterface, path: string) => {
+  const selector = `path:${path.replace(/\\/g, '/')}`
+  const list = await $.process.run(['orca', 'terminal', 'list', '--worktree', selector, '--json'], { timeoutMs: 10_000 })
+  const handle = list.exitCode === 0 ? parseOrcaTerminal(list.stdout) : null
+  const shown =
+    handle === null
+      ? await $.process.run(['orca', 'terminal', 'create', '--worktree', selector, '--focus', '--json'], { timeoutMs: 20_000 })
+      : await $.process.run(['orca', 'terminal', 'switch', '--terminal', handle, '--json'], { timeoutMs: 10_000 })
+  if (shown.exitCode !== 0) {
+    $.ui.toast(`Orca could not show ${path}: ${(shown.stderr || shown.stdout).trim()}`)
+  }
+}
+
+/**
+ * Checks a stacked pull request's branch out in a new worktree beside this
+ * one, named after the branch, then brings Orca to it. `git worktree add`
+ * checks out the branch itself, tracking the remote one; `orca worktree
+ * create` would make a new branch with a number on the end instead.
+ */
+const createWorktree = async ($: EngineInterface, worktree: string, branch: string) => {
+  await update($, creating, list => [...list, branch])
+  try {
+    await $.process.run(['git', 'fetch', 'origin', branch], { timeoutMs: 120_000 })
+    let path = siblingFolder(worktree, branch)
+    for (let n = 2; await $.fs.exists(path); n += 1) {
+      path = siblingFolder(worktree, `${branch}-${n}`)
+    }
+    const added = await $.process.run(['git', 'worktree', 'add', path, branch], { timeoutMs: 600_000 })
+    if (added.exitCode !== 0) {
+      $.ui.toast(`Could not make a worktree for ${branch}: ${added.stderr.trim()}`)
+      return
+    }
+    await refreshCheckedOut($)
+    await goToWorktree($, path)
+  } finally {
+    await update($, creating, list => list.filter(b => b !== branch))
+  }
+}
+
 const refreshAll = async ($: EngineInterface) => {
   await Promise.allSettled([refreshHeader($), refreshRepo($), refreshAgents($), refreshCheckedOut($)])
 }
@@ -819,6 +882,7 @@ export const register: Register = (on, options) => {
     const pr = await read($, pullRequest)
     const chain = await read($, stack)
     const worktrees = await read($, checkedOut)
+    const beingMade = await read($, creating)
     const working = await read($, agents)
     const activity = workingOnText(await read($, workingOn))
     const newest = list.length - 1
@@ -949,25 +1013,53 @@ export const register: Register = (on, options) => {
                     {/* The status opens the pull request's Reviewable page. */}
                     <Box flexShrink={0}>
                       <Link href={reviewableUrl(s.url)}>
-                        <Text underline bold={s.number === pr?.number} color={s.number === pr?.number ? 'suggestion' : undefined}>
+                        {/* A draft stands out in the same color as the current pull request. */}
+                        <Text
+                          underline
+                          bold={s.number === pr?.number}
+                          color={s.number === pr?.number || s.status === 'draft' ? 'suggestion' : undefined}
+                        >
                           ({s.status})
                         </Text>
                       </Link>
                     </Box>
-                    {/* Where this machine has the branch checked out, and whether it matches the remote. */}
+                    {/*
+                      Where this machine has the branch checked out, and whether it matches the remote.
+                      "worktree" brings Orca to it; when the branch has several, each is named by its folder.
+                    */}
                     {worktrees
                       .filter(w => w.remoteBranch === s.head)
-                      .map(w => (
+                      .map((w, _, here) => (
                         <Box key={`w${w.path}`} flexShrink={0} flexDirection="row" gap={1}>
-                          <Text bold={w.path === git.worktree} color={w.path === git.worktree ? 'suggestion' : undefined}>
-                            {w.path === git.worktree ? '<-- worktree' : w.path}
-                          </Text>
+                          {w.path === git.worktree ? (
+                            <Text bold color="suggestion">
+                              {'<-- you are here'}
+                            </Text>
+                          ) : (
+                            <Button key={`go${w.path}`} plain onPress={() => goToWorktree($, w.path)}>
+                              <Text underline>{here.length > 1 ? (w.path.split(/[\\/]/).pop() ?? w.path) : 'worktree'}</Text>
+                            </Button>
+                          )}
                           {w.sync !== 'in sync' && <Text color="warning">{w.sync}</Text>}
                           {w.agent !== null && (
                             <Text color={w.agent === 'working' ? 'suggestion' : 'warning'}>
                               {w.agent === 'working' ? 'agent working' : 'agent waiting'}
                             </Text>
                           )}
+                        </Box>
+                      ))}
+                    {/* An open pull request not checked out here can be, beside this worktree. */}
+                    {(s.status === 'open' || s.status === 'draft') &&
+                      !worktrees.some(w => w.remoteBranch === s.head) &&
+                      (beingMade.includes(s.head) ? (
+                        <Box flexShrink={0}>
+                          <Text dimColor>making worktree…</Text>
+                        </Box>
+                      ) : (
+                        <Box flexShrink={0}>
+                          <Button key={`make${s.head}`} plain dimColor onPress={() => createWorktree($, git.worktree, s.head)}>
+                            <Text underline>create worktree</Text>
+                          </Button>
                         </Box>
                       ))}
                   </Box>

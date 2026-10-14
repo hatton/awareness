@@ -121,6 +121,8 @@ declare module 'claude-code' {
       workingOn: WorkingOn
       agents: readonly RunningAgent[]
       checkedOut: readonly CheckedOut[]
+      /** The branches a worktree is being made for. */
+      creating: readonly string[]
     }
   }
 }
