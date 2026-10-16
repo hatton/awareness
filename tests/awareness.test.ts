@@ -623,3 +623,78 @@ test('each stacked PR links to its worktree, or offers to make one', async ($, o
   expect(runs.filter(a => a[0] === 'orca' && a[1] === 'terminal').map(a => a[2])).toEqual(['list', 'switch'])
   await ui.unmount()
 })
+
+/** The person typing /awareness at the prompt. */
+const TYPED_AWARENESS = {
+  command: 'awareness',
+  args: '',
+  origin: { kind: 'composer' },
+  presentation: { isFullscreen: true, columns: 160 },
+} as const
+
+test('/awareness turns the mod off and on, and remembers off for later sessions', async ($, on) => {
+  answerBottoms(on)
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1 }, rateLimits: [] } }) as never)
+  on('settings.read', () => ({ value: {} }) as never)
+  // Each read of the running agents is one refresh, so the count shows whether the timers run.
+  let refreshes = 0
+  on('agent.list', () => { refreshes++; return { value: [] } as never })
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '' } }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  const store = new Map<string, unknown>()
+  on('store.get', ($, e) => ({ value: store.get(e.key) }) as never)
+  on('store.set', ($, e) => { store.set(e.key, e.value); return { value: undefined } as never })
+  on('store.delete', ($, e) => { store.delete(e.key); return { value: undefined } as never })
+  const open = new Set<string>()
+  on('ui.open', ($, e) => { open.add(e.id); return { value: { isPlaced: true } } as never })
+  on('ui.close', ($, e) => { open.delete(e.id); return { value: undefined } as never })
+  on('ui.panes', () => ({ value: [...open].map(id => ({ id, title: id, isPlaced: true })) }) as never)
+  const clock = mock.clock(on)
+  on('session.start', ($, e) => e as never)
+  /** How many refreshes the timers make in the next ten seconds. */
+  const timedRefreshes = async () => {
+    const before = refreshes
+    await clock.advance(10_000)
+    return refreshes - before
+  }
+
+  await $.session.start({ source: 'startup', cwd: 'D:/w' } as never)
+  await clock.settle()
+  expect([...open]).toEqual(['awareness'])
+  expect(await timedRefreshes()).toBe(1)
+
+  const off = await $.command.run(TYPED_AWARENESS)
+  expect(off.text).toBe('Awareness is off, in this session and the ones after it. Type /awareness to turn it back on.')
+  expect([[...open], store.get('off')]).toEqual([[], true])
+  expect(await timedRefreshes()).toBe(0)
+
+  const back = await $.command.run(TYPED_AWARENESS)
+  expect(back.text).toBe('Awareness is on.')
+  expect([[...open], store.has('off')]).toEqual([['awareness'], false])
+  await clock.settle()
+  expect(await timedRefreshes()).toBe(1)
+
+  // While on, with the pane closed by hand, the command opens the pane again and leaves the mod on.
+  open.clear()
+  const reopened = await $.command.run(TYPED_AWARENESS)
+  expect(reopened.text).toBe('Awareness pane opened. Type /awareness again to turn Awareness off.')
+  expect([...open]).toEqual(['awareness'])
+  expect(await timedRefreshes()).toBe(1)
+})
+
+test('a session starts with the mod off when it was turned off before', async ($, on) => {
+  answerBottoms(on)
+  let refreshes = 0
+  on('agent.list', () => { refreshes++; return { value: [] } as never })
+  on('command.register', () => ({ value: undefined }) as never)
+  on('store.get', ($, e) => ({ value: e.key === 'off' ? true : undefined }) as never)
+  let opened = 0
+  on('ui.open', () => { opened++; return { value: { isPlaced: true } } as never })
+  const clock = mock.clock(on)
+  on('session.start', ($, e) => e as never)
+
+  await $.session.start({ source: 'startup', cwd: 'D:/w' } as never)
+  await clock.advance(60_000)
+  expect([opened, refreshes]).toEqual([0, 0])
+})

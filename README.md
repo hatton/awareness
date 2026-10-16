@@ -12,7 +12,9 @@ A [Claude Code](https://claude.com/claude-code) mod that keeps a pane open besid
 - subagents still running
 - your last three prompts, each on one line, the newest highlighted
 
-The pane docks beside the transcript in Claude Code's fullscreen layout when the terminal is at least 110 columns wide; otherwise it sits above the prompt. It opens itself when a session starts on a terminal at least 144 columns wide. Type `/awareness` to open it at any width.
+The pane docks beside the transcript in Claude Code's fullscreen layout when the terminal is at least 110 columns wide; otherwise it sits above the prompt. It opens itself when a session starts on a terminal at least 144 columns wide.
+
+Type `/awareness` to turn the mod off: the pane closes, and the mod stops reading git, `gh`, YouTrack and usage, and stops labelling the Orca tab. It stays off in later sessions until you type `/awareness` again. If the mod is on but you closed its pane, `/awareness` opens the pane again at any width.
 
 In Orca, it also keeps the session's terminal tab labelled with a two- or three-word summary of what the conversation is working on, asked for again every few prompts. Until the first summary, the words of the card's branch name stand in (`BL-15958-crop-marks` reads `crop marks`). Turn this off with the "Label the Orca tab" row in `/config`.
 

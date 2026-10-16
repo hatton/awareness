@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Card, CheckedOut, Header, PullRequest, Recent, Repo, RunningAgent, Stack, StackEntry, WorkingOn } from '../types'
 
@@ -744,31 +744,51 @@ const refreshAll = async ($: EngineInterface) => {
   await Promise.allSettled([refreshHeader($), refreshRepo($), refreshAgents($), refreshCheckedOut($)])
 }
 
+/**
+ * Opens the pane, reads everything and starts the timers that read it again.
+ * Returns those timers.
+ */
+const startWatching = async ($: EngineInterface, labelOrcaTab: boolean) => {
+  void $.ui.open({ id: PANE, title: TITLE })
+  await Promise.allSettled([refreshAll($), readEffortSetting($)])
+  void refreshRemote($)
+  if (labelOrcaTab) {
+    void refreshTabLabel($).catch(() => undefined)
+  }
+  return [
+    $.clock.every(REFRESH_MS, () => refreshAll($)),
+    $.clock.every(PULL_REQUEST_REFRESH_MS, () => refreshRemote($)),
+  ]
+}
+
+// The `$.store` key that holds whether the person turned the mod off with /awareness.
+const OFF_KEY = 'off'
+
 export const register: Register = (on, options) => {
   const labelOrcaTab = options.labelOrcaTab !== false
+  // Whether the mod is on; read from `$.store` at each session start.
+  let isOn = true
+  // The timers startWatching started.
+  let timers: Timer[] = []
 
   // Claude Code docks the pane beside the transcript in the fullscreen layout
   // from 110 columns; elsewhere it seats it above the prompt.
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'awareness',
-      description: 'Show the Awareness pane: model, git state, usage, agents and your last three prompts',
+      description: 'Turn the Awareness mod on or off: its pane, its git and usage polling, and its Orca tab label',
     })
-    void $.ui.open({ id: PANE, title: TITLE })
-    await Promise.allSettled([refreshAll($), readEffortSetting($)])
-    void refreshRemote($)
-    if (labelOrcaTab) {
-      void refreshTabLabel($).catch(() => undefined)
+    isOn = (await $.store.get(OFF_KEY).catch(() => undefined)) !== true
+    if (isOn) {
+      timers = await startWatching($, labelOrcaTab)
     }
-    $.clock.every(REFRESH_MS, () => refreshAll($))
-    $.clock.every(PULL_REQUEST_REFRESH_MS, () => refreshRemote($))
 
     return next(e)
   })
 
   // /clear starts the conversation over, so the activity starts over too.
   on('classic.SessionStart', async ($, e, next) => {
-    if (e.source === 'clear') {
+    if (isOn && e.source === 'clear') {
       await update($, workingOn, () => NOTHING_YET).catch(() => undefined)
     }
     return next(e)
@@ -776,23 +796,39 @@ export const register: Register = (on, options) => {
 
   // A slash command typed at the prompt; noteTypedSkill skips built-ins.
   on('command.run', async ($, e, next) => {
-    if (e.command !== 'awareness') {
+    if (isOn && e.command !== 'awareness') {
       await noteTypedSkill($, `/${e.command}`).catch(() => undefined)
     }
     return next(e)
   })
 
+  // While the mod is on but the person closed its pane, /awareness opens the pane again instead of turning the mod off.
   on('command.run', { command: 'awareness' }, async $ => {
-    await $.ui.open({ id: PANE, title: TITLE })
-
-    return { text: 'Awareness pane opened.' }
+    if (!isOn) {
+      isOn = true
+      await $.store.delete(OFF_KEY)
+      timers = await startWatching($, labelOrcaTab)
+      return { text: 'Awareness is on.' }
+    }
+    if (!(await $.ui.panes()).some(pane => pane.id === PANE)) {
+      await $.ui.open({ id: PANE, title: TITLE })
+      return { text: 'Awareness pane opened. Type /awareness again to turn Awareness off.' }
+    }
+    isOn = false
+    await $.store.set(OFF_KEY, true)
+    for (const timer of timers) {
+      timer.cancel()
+    }
+    timers = []
+    await $.ui.close({ id: PANE })
+    return { text: 'Awareness is off, in this session and the ones after it. Type /awareness to turn it back on.' }
   })
 
   // Records only what the person typed (here or through Remote Control), not
   // prompts raised by plugins, schedules, task notifications or other agents.
   on('prompt.submit', async ($, e, next) => {
     const text = oneLine(e.text)
-    if ((e.origin.kind === 'composer' || e.origin.kind === 'bridge') && text) {
+    if (isOn && (e.origin.kind === 'composer' || e.origin.kind === 'bridge') && text) {
       // A failed write must not hold up the prompt.
       await update($, recent, list => [...list, text].slice(-SHOWN)).catch(() => undefined)
       await noteTypedSkill($, e.text).catch(() => undefined)
@@ -803,7 +839,7 @@ export const register: Register = (on, options) => {
   // The model starting a skill names the activity.
   on('tool.call', { tool: 'Skill' }, async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId === undefined && result.deny === undefined && result.isError !== true) {
+    if (isOn && e.agentId === undefined && result.deny === undefined && result.isError !== true) {
       await update($, workingOn, w => ({ ...w, skill: skillTitle(e.skill) })).catch(() => undefined)
     }
     return result
@@ -812,7 +848,7 @@ export const register: Register = (on, options) => {
   // The main conversation's task list names the step in progress.
   on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId === undefined && result.deny === undefined && result.isError !== true) {
+    if (isOn && e.agentId === undefined && result.deny === undefined && result.isError !== true) {
       const doing = e.activeForm ?? e.subject
       await update($, workingOn, w => ({
         ...w,
@@ -824,7 +860,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'TaskUpdate' }, async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId === undefined && result.deny === undefined && result.isError !== true) {
+    if (isOn && e.agentId === undefined && result.deny === undefined && result.isError !== true) {
       await update($, workingOn, w => ({ ...w, tasks: updatedTasks(w.tasks, e) })).catch(() => undefined)
     }
     return result
@@ -832,7 +868,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'TodoWrite' }, async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId === undefined && result.deny === undefined && result.isError !== true) {
+    if (isOn && e.agentId === undefined && result.deny === undefined && result.isError !== true) {
       const todo = e.todos.find(t => t.status === 'in_progress')?.activeForm ?? null
       await update($, workingOn, w => ({ ...w, todo })).catch(() => undefined)
     }
@@ -842,7 +878,7 @@ export const register: Register = (on, options) => {
   // Each main-loop request carries the effort it asks for, and its response
   // moves the context window's fill.
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId !== undefined) {
+    if (!isOn || e.agentId !== undefined) {
       return yield* next(e)
     }
     const effort = e.effort === undefined ? null : String(e.effort)
@@ -856,13 +892,18 @@ export const register: Register = (on, options) => {
   // A tool call can commit, push, edit a file or start an agent.
   on('tool.call', async ($, e, next) => {
     const result = await next(e)
-    void Promise.allSettled([refreshRepo($), refreshAgents($)])
+    if (isOn) {
+      void Promise.allSettled([refreshRepo($), refreshAgents($)])
+    }
     return result
   })
 
   // The main conversation's turn ending leaves Claude idle, so nothing is being worked on.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    if (!isOn) {
+      return result
+    }
     if (e.agentId === undefined) {
       await update($, workingOn, () => NOTHING_YET).catch(() => undefined)
     }
